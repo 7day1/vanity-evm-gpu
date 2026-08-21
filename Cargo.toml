@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "EVM vanity address generator with auto-adaptive GPU (OpenCL) acceleration, CPU verification oracle, wallet-unbound, local private keys."
 license = "MIT"
-repository = "https://github.com/metacici/vanity-evm-gpu"
+repository = "https://github.com/7day1/vanity-evm-gpu"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
