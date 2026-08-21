@@ -64,7 +64,15 @@ GPU 路径需要系统有 OpenCL：
    .\vanity-evm-gpu.exe --benchmark 10
    # 期望看到 [benchmark] XX.XXMkeys/s over 10s (GPU, batch=4096)
    ```
-   6750 GRE 上 `--batch 65536` 通常能榨到 100–250 Mkeys/s（默认 4096 偏保守，可拉大），先小 batch 验证稳定性再调高。
+   **6750 GRE 实测**（OpenCL 2.1 AMD-APP 3652.0，OpenCL + RDNA 2 朴素 Jacobian kernel）：
+
+   | `--batch` | rate | dispatches / 10s | ms / dispatch |
+   |---|---|---|---|
+   | 4096（默认） | ~1.1 Mkeys/s | ~190 | ~52 |
+   | 65536 | **1.14 Mkeys/s** | 175 | 57 |
+   | 1048576 | **1.24 Mkeys/s** | 12 | ~840 |
+
+   Batch 翻 16 倍速率只提 9% —— **瓶颈在单次 dispatch 的同步开销**（`finish()` + CPU 端 base point 加法 + enqueue，约 50ms/次），kernel 本身只占 5-10%。需要 5-10x 提速得改 pipeline（去掉同步 + GPU 端算 base + unroll），改动量较大；当前速率对个人 vanity 地址生成（6 位前缀 ~14 秒、8 位 ~10 小时）够用，先用着。
 6. **要 GUI？** 双击 `vanity-evm-gui.exe`，或 `scripts\win\run-gui.bat` 一键拉起（设备下拉框已列 6750 GRE，先点「自检 (Self-Test)」，再填前缀/后缀开始）。
 
 **Win11 上的安全提示**：GPU 候选会被强制 CPU 复核（见 [安全须知](#安全须知生成真实钱包前必读)）；首次跑通 `--self-test` 之前不要把任何真地址发到外面。
