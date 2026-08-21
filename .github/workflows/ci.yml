@@ -57,6 +57,32 @@ jobs:
         with:
           toolchain: stable-x86_64-pc-windows-msvc
 
+      - name: Install OpenCL SDK headers + import lib
+        # The ocl/cl-sys crates link against OpenCL.lib and hard-code the
+        # `C:\Program Files (x86)\OCL_SDK_Light` search path on Windows.
+        # GH-hosted runners have no OpenCL SDK installed, so we fetch the
+        # Khronos Windows SDK and drop its import lib at the exact path
+        # cl-sys looks for (lib\x86_64\OpenCL.lib).
+        # (This is build-time only: the produced .exe loads OpenCL at runtime
+        # through the ICD loader, so no SDK is shipped with the artifact.)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdkRoot = 'C:\Program Files (x86)\OCL_SDK_Light'
+          $zip = Join-Path $env:RUNNER_TEMP 'opencl-sdk.zip'
+          curl.exe -L --retry 3 -o $zip `
+            'https://github.com/KhronosGroup/OpenCL-SDK/releases/download/v2026.05.29/OpenCL-SDK-v2026.05.29-Win-x64.zip'
+          New-Item -ItemType Directory -Force -Path $sdkRoot | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $sdkRoot -Force
+          $sdkDir = Get-ChildItem $sdkRoot -Directory |
+            Where-Object { $_.Name -like 'OpenCL-SDK-*' } | Select-Object -First 1
+          $libDir = Join-Path $sdkRoot 'lib\x86_64'
+          New-Item -ItemType Directory -Force -Path $libDir | Out-Null
+          Copy-Item (Join-Path $sdkDir.FullName 'lib\OpenCL.lib') `
+            (Join-Path $libDir 'OpenCL.lib') -Force
+          Write-Host "OpenCL.lib installed at:" (Join-Path $libDir 'OpenCL.lib')
+          Get-Item (Join-Path $libDir 'OpenCL.lib') | Select-Object FullName, Length
+
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:

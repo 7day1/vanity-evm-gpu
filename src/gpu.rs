@@ -1135,6 +1135,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a real OpenCL GPU (CI runners have none); run with `cargo test -- --ignored`"]
     fn radeon_scalar_mul_matches_cpu() {
         let proque = match first_gpu_proque() {
             Some(p) => p,
@@ -1178,6 +1179,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a real OpenCL GPU (CI runners have none); run with `cargo test -- --ignored`"]
     fn radeon_self_test_runs() {
         // This exercises the full gated path; it only asserts the function
         // returns a bool (true on a working device, false otherwise) without
