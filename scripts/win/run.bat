@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM  vanity-evm-gpu on Windows 11 — interactive launcher
+REM  vanity-evm-gpu on Windows 11 - interactive launcher
 REM
 REM  Double-click this file (or run it from PowerShell) and
 REM  pick a mode. Each command resolves the binary relative to

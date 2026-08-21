@@ -1,4 +1,4 @@
-# vanity-evm-gpu on Windows 11 — one-shot setup helpers
+# vanity-evm-gpu on Windows 11 - one-shot setup helpers
 #
 # Run from PowerShell (right-click `setup.ps1` -> Run with PowerShell,
 # or `powershell -ExecutionPolicy Bypass -File .\setup.ps1`). This script
@@ -90,3 +90,6 @@ Write-Host ''
 
 Write-Host '== Done ==' -ForegroundColor Cyan
 Write-Host 'Next step: double-click run.bat (in scripts\win\) and pick "List devices" first.'
+Write-Host ''
+Write-Host 'Press ENTER to close this window...' -ForegroundColor Gray
+Read-Host | Out-Null
