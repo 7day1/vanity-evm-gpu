@@ -56,6 +56,10 @@ struct GuiState {
     stop_requested: bool,
     /// Result of the last GPU self-test ("PASS" / "FAIL" / message), if run.
     self_test_result: Option<String>,
+    /// Result of the last EXPERIMENTAL Radeon multi-dispatch self-test,
+    /// if run. The default Jacobian path is always used by `run_gpu`; this
+    /// second button only validates the alternative kernel layout.
+    radeon_self_test_result: Option<String>,
 }
 
 impl Default for GuiState {
@@ -72,6 +76,7 @@ impl Default for GuiState {
             redact: false,
             stop_requested: false,
             self_test_result: None,
+            radeon_self_test_result: None,
         }
     }
 }
@@ -190,6 +195,12 @@ impl eframe::App for VanityApp {
                 {
                     self.run_self_test();
                 }
+                if ui
+                    .add_enabled(!running, egui::Button::new("Radeon 自检 (Experimental)"))
+                    .clicked()
+                {
+                    self.run_radeon_self_test();
+                }
                 ui.label("只验证 GPU，不搜索（新手安全演练）");
             });
 
@@ -274,6 +285,24 @@ impl eframe::App for VanityApp {
                     egui::Color32::GRAY
                 };
                 ui.colored_label(color, format!("自检结果: {}", res));
+            }
+
+            // ---- radeon multi-dispatch self-test result ----
+            let radeon_self_test_result = {
+                let s = self.state.lock().unwrap();
+                s.radeon_self_test_result.clone()
+            };
+            if let Some(res) = radeon_self_test_result {
+                ui.separator();
+                let pass = res.starts_with("PASS");
+                let color = if pass {
+                    egui::Color32::from_rgb(40, 160, 60)
+                } else if res.starts_with("FAIL") {
+                    egui::Color32::RED
+                } else {
+                    egui::Color32::GRAY
+                };
+                ui.colored_label(color, format!("Radeon 多 dispatch 自检: {}", res));
             }
 
             // ---- result ----
@@ -380,6 +409,27 @@ impl VanityApp {
                 "PASS — GPU 内核与 CPU 参考一致".to_string()
             } else {
                 "FAIL — 该设备 GPU 结果不可信，请勿使用".to_string()
+            });
+        });
+    }
+
+    /// Spawn a background thread that runs `gpu::radeon_self_test`, which
+    /// exercises the EXPERIMENTAL multi-dispatch scalar_mul path (alternative
+    /// to the default Jacobian kernel). Useful for Apple Silicon and Intel
+    /// Mac users whose default kernel hit `cvms_element_build_from_source`
+    /// crashes on certain Radeon Pro / older Radeon cards. Only acts on
+    /// `DeviceSelection::Auto`; the multi-dispatch path always picks whatever
+    /// GPU it can probe.
+    fn run_radeon_self_test(&mut self) {
+        self.notice.clear();
+        let state = self.state.clone();
+        thread::spawn(move || {
+            let ok = gpu::radeon_self_test(gpu::DeviceSelection::Auto);
+            let mut s = state.lock().unwrap();
+            s.radeon_self_test_result = Some(if ok {
+                "PASS — Radeon 多 dispatch 与 CPU 参考一致".to_string()
+            } else {
+                "FAIL — 该设备 Radeon 多 dispatch 结果不可信".to_string()
             });
         });
     }
@@ -588,6 +638,7 @@ mod tests {
             redact: false,
             stop_requested: true,
             self_test_result: None,
+            radeon_self_test_result: None,
         };
         // The reset path overwrites the whole struct; the old `result` is
         // dropped (and zeroized by ZeroizeOnDrop) rather than carried over.

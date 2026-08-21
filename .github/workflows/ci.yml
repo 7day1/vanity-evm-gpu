@@ -116,3 +116,49 @@ jobs:
             target/x86_64-pc-windows-msvc/release/vanity-evm-gpu.exe
             target/x86_64-pc-windows-msvc/release/vanity-evm-gui.exe
           fail_on_unmatched_files: true
+
+  macos-build:
+    name: macOS build (no GPU; Apple Silicon + Intel)
+    runs-on: macos-latest
+    # macos-latest ships with OpenCL.framework at /System/Library/Frameworks,
+    # so no ICD install is needed for the link step. Self-test is intentionally
+    # NOT executed here because GH-hosted macOS runners have no usable GPU;
+    # the user runs --self-test / --radeon-self-test locally on their Mac to
+    # validate the GPU path on real Apple Silicon hardware.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            target -> .cargo-target/macos
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Build CLI (release)
+        run: cargo build --release
+
+      - name: Build GUI (release)
+        run: cargo build --release --bin vanity-evm-gui
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: CPU smoke (no GPU required)
+        run: ./target/release/vanity-evm-gpu --prefix cafe --cpu --dry-run
+
+      - name: Upload macOS binaries as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vanity-evm-gpu-macos-universal
+          path: |
+            target/release/vanity-evm-gpu
+            target/release/vanity-evm-gui
+          if-no-files-found: error
+          retention-days: 30

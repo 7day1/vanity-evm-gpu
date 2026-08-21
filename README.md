@@ -87,6 +87,39 @@ GPU 路径需要系统有 OpenCL：
 | GUI 启动后黑屏 / 报缺 `XAML` | 极少；右键 `vanity-evm-gui.exe` → 属性 → 兼容性，勾「禁用显示缩放」 |
 | `--batch` 设到 1<<20+ 后 hang | 任何 GPU 都看门狗；遇到 hang 加 `--max-seconds 30` 让它自动退出，batch 降到 65536 重试 |
 
+### macOS Apple M1/M2/M3/M4 + Intel Mac（OpenCL 路径）
+
+macOS 自带 OpenCL.framework，无需装 ICD。但有几点要确认：
+
+1. **OpenCL 现状**：Apple 从 macOS 10.14 起将 OpenCL 标记为 deprecated，但 `OpenCL.framework` 仍随系统自带、Apple Silicon 上仍可用（Apple 自己的 OpenCL 2.0 编译器）。Metal Compute 是更"现代"的替代，但本项目目前只用 OpenCL（不需改 backend）。
+2. **Apple Silicon 上的 GPU**：`M1/M2/M3/M4` 的统一内存 GPU 都被识别为 OpenCL device，名称类似 `Apple M2`。`--list-devices` 能看到就跑得起来。
+3. **Radeon Pro 560X 等旧 Radeon**（仅 Intel Mac）：Apple 自家的 OpenCL 编译器在 AMD Radeon 上偶尔报 `cvms_element_build_from_source` 崩溃（编译期），导致默认 Jacobian kernel 编译失败。这种卡会被运行时探针自动跳过，落到 Intel Iris/Intel UHD 上。如果你想尝试 experimental 多 dispatch 路径绕过这个问题：
+
+   ```bash
+   ./vanity-evm-gpu --radeon-self-test
+   ```
+
+   这个路径用 256 次小 dispatch 替代单个大 kernel，规避 `cvms_element_build_from_source` 崩溃。**实验性**——只在你的本机 Radeon 上跑通过才能信任，CI 不验证。
+
+4. **Apple Silicon `--batch` 调参**：`M1/M2/M3/M4` 集成 GPU 的看门狗比独显严格，默认 4096 是安全的。`--batch` 调到 65536+ 时偶发 hang，建议保持默认或加 `--max-seconds 30` 兜底。
+5. **首次验证**：跟 Windows 一样先跑 `--self-test`，8/8 PASS 才信任。
+
+```bash
+# macOS 上构建（Apple Silicon 与 Intel 通用）
+cargo build --release           # 同时产出 vanity-evm-gpu 和 vanity-evm-gui
+
+# 列出 GPU
+./vanity-evm-gpu --list-devices
+
+# 首次验证
+./vanity-evm-gpu --self-test
+
+# Apple Silicon 上跑 8 位前缀（~1 小时量级）
+./vanity-evm-gpu --prefix deadbeef
+```
+
+CI 在 macOS runner 上验证编译（无 GPU 所以不跑 self-test），artifact `vanity-evm-gpu-macos-universal` 含 CLI 与 GUI 两个 Mach-O binary。
+
 CPU 路径无需 OpenCL。
 
 ## GUI（窗口界面）
