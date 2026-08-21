@@ -415,11 +415,12 @@ impl VanityApp {
 
     /// Spawn a background thread that runs `gpu::radeon_self_test`, which
     /// exercises the EXPERIMENTAL multi-dispatch scalar_mul path (alternative
-    /// to the default Jacobian kernel). Useful for Apple Silicon and Intel
-    /// Mac users whose default kernel hit `cvms_element_build_from_source`
-    /// crashes on certain Radeon Pro / older Radeon cards. Only acts on
-    /// `DeviceSelection::Auto`; the multi-dispatch path always picks whatever
-    /// GPU it can probe.
+    /// to the default Jacobian kernel). NOTE: this path has NO confirmed
+    /// working GPU yet — on macOS (Apple OpenCL compiler) it fails with
+    /// `cvms_element_build_from_source`, and on Windows/Linux the default
+    /// Jacobian path is already correct, so this button is mainly a diagnostic
+    /// for developers. On a healthy GPU it should report PASS; on macOS it
+    /// will report FAIL (expected).
     fn run_radeon_self_test(&mut self) {
         self.notice.clear();
         let state = self.state.clone();

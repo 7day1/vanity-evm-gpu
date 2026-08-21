@@ -19,7 +19,7 @@ EVM 靓号地址生成器，**自动适配 GPU（OpenCL）加速，CPU 兜底验
 - **CPU 验证 oracle**：GPU 结果强制 CPU 复核。
 - **`--self-test`**：用 CPU 参考实现逐位校验 GPU 内核，**需在带 GPU 的机器上**跑一次（无 OpenCL 设备时会直接报错退出）。
 - **GPU 设备选择**：`--device auto`（默认，运行时多向量探针验证每台设备后用首个可靠设备）/`--device <索引>`/`--device <名称子串>`；`--list-devices` 列出可用 GPU。凡通过探针的 GPU 才被采用，编译失败或计算与 CPU 参考不一致的会被自动跳过。
-- **实测速率**：运行时打印 `Mkeys/s`；`--benchmark N` 跑 N 秒纯速率基准（不落盘、不产出候选）。注意：Apple 核显吞吐远低于独立 GPU（本机 Intel UHD 630 约 0.001 Mkeys/s 量级），难任务主要价值在于**验证 GPU 路径正确性 + CPU 兜底安全**，而非追求速度。
+- **实测速率**：运行时打印 `Mkeys/s`；`--benchmark N` 跑 N 秒纯速率基准（仅 GPU，不落盘、不产出候选）。macOS 上 GPU 路径不可用，请用 `--cpu` 走 CPU 后端（速率低但正确，适合验证工具本身或小规模 vanity 搜索）。
 
 ## 构建
 
@@ -30,8 +30,8 @@ cargo build --release
 依赖：`secp256k1`、`sha3`(Keccak)、`ocl`(OpenCL)、`rand`、`zeroize`、`clap`。
 GPU 路径需要系统有 OpenCL：
 
-- **Intel Mac（2018 及更早的 15" MacBook Pro 等）**：OpenCL 1.2 可用。**核显（Intel UHD 630 等）已验证可用**；离散 AMD（Radeon Pro 560X 等）在本机因驱动编译限制（`cvms_element_build_from_source` 失败）无法编译本 kernel，工具会**运行时自动跳过**不可用设备、回退到可用的核显或 CPU。
-- **Apple Silicon（M 系列）Mac**：OpenCL 已弃用/不可用，会自动回退 CPU。
+- **Intel Mac（含 Radeon Pro 560X / Intel UHD 630 等）**：OpenCL 在系统里存在，但本项目的 kernel 在 macOS 的 Apple OpenCL 编译器上**编译失败**（`cvms_element_build_from_source` 报错），实测 `--self-test` 在 560X 与 UHD 630 上**均 FAIL**。因此 macOS 上请直接加 `--cpu` 或 `--no-gpu` 走 CPU 后端，不要依赖 GPU 路径。
+- **Apple Silicon（M 系列）Mac**：OpenCL 已弃用/不可用，自动回退 CPU。
 - **Linux**：装 ICD 与驱动头 —— `apt install ocl-icd-opencl-dev`，再装对应显卡驱动（如 NVIDIA 的 `nvidia-opencl-icd`、AMD 的 `rocm-opencl-icd` / `mesa-opencl-icd`）。
 - **Windows**：安装显卡厂商的 OpenCL 运行时（NVIDIA CUDA SDK / AMD ADL 或 Intel 驱动），并把 `OpenCL.dll` 所在目录加入 `PATH`；`--self-test` 会在有设备时报 PASS。
 
@@ -87,40 +87,28 @@ GPU 路径需要系统有 OpenCL：
 | GUI 启动后黑屏 / 报缺 `XAML` | 极少；右键 `vanity-evm-gui.exe` → 属性 → 兼容性，勾「禁用显示缩放」 |
 | `--batch` 设到 1<<20+ 后 hang | 任何 GPU 都看门狗；遇到 hang 加 `--max-seconds 30` 让它自动退出，batch 降到 65536 重试 |
 
-### macOS Apple M1/M2/M3/M4 + Intel Mac（OpenCL 路径）
+### macOS（仅 CPU 模式可靠）
 
-macOS 自带 OpenCL.framework，无需装 ICD。但有几点要确认：
+macOS 自带 `OpenCL.framework`，但本项目的 OpenCL kernel **在 Apple 的 OpenCL 编译器上编译失败**（实测在 Intel Mac 的 Radeon Pro 560X 与 Intel UHD 630 上 `--self-test` 均 FAIL，报错 `cvms_element_build_from_source`）。因此：
 
-1. **OpenCL 现状**：Apple 从 macOS 10.14 起将 OpenCL 标记为 deprecated，但 `OpenCL.framework` 仍随系统自带、Apple Silicon 上仍可用（Apple 自己的 OpenCL 2.0 编译器）。Metal Compute 是更"现代"的替代，但本项目目前只用 OpenCL（不需改 backend）。
-2. **Apple Silicon 上的 GPU**：`M1/M2/M3/M4` 的统一内存 GPU 都被识别为 OpenCL device，名称类似 `Apple M2`。`--list-devices` 能看到就跑得起来。
-3. **Radeon Pro 560X 等旧 Radeon**（仅 Intel Mac）：Apple 自家的 OpenCL 编译器在 AMD Radeon 上偶尔报 `cvms_element_build_from_source` 崩溃（编译期），导致默认 Jacobian kernel 编译失败。这种卡会被运行时探针自动跳过，落到 Intel Iris/Intel UHD 上。如果你想尝试 experimental 多 dispatch 路径绕过这个问题：
+> **macOS 用户请直接加 `--cpu` 或 `--no-gpu` 走 CPU 后端。** 不要依赖本项目的 GPU 路径在 macOS 上工作。
 
-   ```bash
-   ./vanity-evm-gpu --radeon-self-test
-   ```
-
-   这个路径用 256 次小 dispatch 替代单个大 kernel，规避 `cvms_element_build_from_source` 崩溃。**实验性**——只在你的本机 Radeon 上跑通过才能信任，CI 不验证。
-
-4. **Apple Silicon `--batch` 调参**：`M1/M2/M3/M4` 集成 GPU 的看门狗比独显严格，默认 4096 是安全的。`--batch` 调到 65536+ 时偶发 hang，建议保持默认或加 `--max-seconds 30` 兜底。
-5. **首次验证**：跟 Windows 一样先跑 `--self-test`，8/8 PASS 才信任。
+Apple Silicon（M 系列）上 OpenCL 更已被弃用，同样只能走 CPU。
 
 ```bash
 # macOS 上构建（Apple Silicon 与 Intel 通用）
 cargo build --release           # 同时产出 vanity-evm-gpu 和 vanity-evm-gui
 
-# 列出 GPU
-./vanity-evm-gpu --list-devices
+# 直接走 CPU（推荐，避开无用的 OpenCL probe）
+./vanity-evm-gpu --cpu --prefix deadbeef
 
-# 首次验证
-./vanity-evm-gpu --self-test
-
-# Apple Silicon 上跑 8 位前缀（~1 小时量级）
-./vanity-evm-gpu --prefix deadbeef
+# 或显式跳过 GPU 检测
+./vanity-evm-gpu --no-gpu --suffix 888888888
 ```
 
-CI 在 macOS runner 上验证编译（无 GPU 所以不跑 self-test），artifact `vanity-evm-gpu-macos-universal` 含 CLI 与 GUI 两个 Mach-O binary。
+CI 在 macOS runner 上验证**编译**（无 GPU 所以不跑 self-test），artifact `vanity-evm-gpu-macos-universal` 含 CLI 与 GUI 两个 Mach-O binary。即使下载了 artifact，在 macOS 上也要用 `--cpu`/`--no-gpu`。
 
-CPU 路径无需 OpenCL。
+CPU 路径无需 OpenCL，所有平台通用。
 
 ## GUI（窗口界面）
 
@@ -215,19 +203,22 @@ cargo build --release
 
 > 难度参考：`16^(前缀长度 + 后缀长度)` 次尝试。6 位 ≈ 1600 万（CPU 约 10–20 秒），8 位 ≈ 43 亿（CPU ~1 小时，GPU ~分钟），10 位 ≈ 1.1 万亿（GPU 十几分钟~几小时，CPU 数天）。
 
-### 真机 `--self-test` 输出示例（Intel Mac, macOS 15.7.9, Radeon Pro 560X + Intel UHD 630）
+### 真机 `--self-test` 输出（反面示例：Intel Mac, macOS, Radeon Pro 560X + Intel UHD 630）
 
-> 本机 Radeon Pro 560X 在优化编译下会因 `cvms_element_build_from_source` 失败而无法使用；工具通过运行时设备可靠性探针**自动跳过**它、落到可用的 Intel UHD 630。**无需手动 `--device`**。
+> 这是**真实的 macOS 失败输出**，说明本项目 GPU 路径在 Apple OpenCL 编译器上不可用。macOS 用户应直接走 CPU（`--cpu` / `--no-gpu`），不要期待 GPU 路径能跑通。
 
 ```
-[gpu] probing device: AMD Radeon Pro 560X Compute Engine
-[gpu] probing device: Intel(R) UHD Graphics 630
-[gpu] selected reliable device: Intel(R) UHD Graphics 630
-[self-test] device: Intel(R) UHD Graphics 630
-[self-test] trial 0: OK
-...
-[self-test] trial 7: OK
-[self-test] PASS — GPU kernel matches CPU reference.
+[gpu]    build ProQue on 'Intel(R) UHD Graphics 630': OK
+[gpu]    build ProQue on 'AMD Radeon Pro 560X Compute Engine': ERROR:
+         Error returned by cvms_element_build_from_source
+[gpu]    no reliable GPU device found
+[self-test] FAIL — do not trust GPU results on this device.
+```
+
+**结论**：在 macOS 上看到上面的 FAIL 是正常的。改用：
+
+```bash
+./vanity-evm-gpu --cpu --suffix 888888888
 ```
 
 ## 安全须知（生成真实钱包前必读）

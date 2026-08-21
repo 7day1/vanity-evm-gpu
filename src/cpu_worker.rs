@@ -68,7 +68,6 @@ pub fn run_cpu(
                         break;
                     }
                 }
-                attempts += 1;
                 rng.fill_bytes(&mut buf);
                 let sk = match SecretKey::from_slice(&buf) {
                     Ok(s) => s,
@@ -82,14 +81,21 @@ pub fn run_cpu(
                 let hash = crate::crypto::keccak256(&arr[1..]);
                 let mut addr = [0u8; 20];
                 addr.copy_from_slice(&hash[12..]);
+                // Count this attempt BEFORE the match check so a hit is included
+                // in the aggregate total (previously the winning attempt was
+                // never counted, slightly under-reporting attempts/rate).
+                let _ = total_attempts.fetch_add(1, Ordering::Relaxed);
+                attempts += 1;
                 if addr_matches(&addr, &pat.prefix, &pat.suffix) {
                     if !found.swap(true, Ordering::Relaxed) {
                         *result.lock().unwrap() = Some((buf, addr));
                     }
                     break;
                 }
-                let _ = total_attempts.fetch_add(1, Ordering::Relaxed);
-                if attempts.is_multiple_of(2_000_000) {
+                // Report roughly every 500k attempts for a smoother live rate
+                // across many worker threads (was 2M, which lagged badly when
+                // several workers each only counted their own local `attempts`).
+                if attempts.is_multiple_of(500_000) {
                     let elapsed = start.elapsed().as_secs_f64();
                     let agg = total_attempts.load(Ordering::Relaxed);
                     let rate = agg as f64 / elapsed.max(1e-6);

@@ -45,6 +45,13 @@ struct Cli {
     #[arg(long)]
     cpu: bool,
 
+    /// Skip OpenCL GPU detection entirely (same as --cpu but explicit). Useful
+    /// on hosts where the OpenCL stack is present but broken (e.g. macOS with a
+    /// Radeon Pro 560X that fails inside `cvms_element_build_from_source`), so
+    /// the program does not waste time probing a GPU that can never be used.
+    #[arg(long)]
+    no_gpu: bool,
+
     /// Force GPU mode (error if no OpenCL GPU).
     #[arg(long)]
     gpu: bool,
@@ -195,7 +202,7 @@ fn main() {
     let result_dir = cli.result_dir.unwrap_or_else(|| PathBuf::from("results"));
     let max_seconds = cli.max_seconds.or(cli.duration);
 
-    let backend = if cli.cpu {
+    let backend = if cli.cpu || cli.no_gpu {
         Backend::Cpu
     } else if cli.gpu {
         if !gpu::gpu_available() {
