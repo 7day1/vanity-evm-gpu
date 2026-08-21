@@ -14,6 +14,7 @@ rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 ocl = "0.19"
 eframe = "0.27"
+arboard = "3"
 
 [profile.release]
 panic = "abort"

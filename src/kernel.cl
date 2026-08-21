@@ -4,22 +4,39 @@
 // (see gpu.rs) because Apple's OpenCL 1.2 compiler does not auto-inject
 // <stdint.h>. All fixed-width 64-bit state uses int64_t/uint64_t.
 //
-// Portability notes for Apple OpenCL 1.2 (Intel UHD 630 / AMD Radeon Pro 560X):
-//   * The compiler mis-handles dynamic indexing into file-scope `constant`
-//     arrays, so keccak_f keeps its round constants as function-local `const`.
-//   * The 64-bit rotate() builtin is mis-compiled on the Radeon driver, so we
-//     use a manual rotl64() definition.
-//   * Affine scalar multiplication needs one modular inverse per point
-//     operation; on the Intel UHD 630 that exceeds the macOS display-GPU
-//     watchdog for private keys with many 1-bits. We therefore use Jacobian
-//     projective coordinates: doubling and addition need no inverses, and only
-//     the final conversion back to affine performs a single inverse.
-//   * scalar_mul() and keccak256_addr() were historically cross-optimized
-//     incorrectly on Radeon, so we keep a three-pass pipeline connected by
-//     global scratch buffers:
-//       derive_pubkeys : key -> (Qx, Qy)
-//       hash_addrs     : (Qx, Qy) -> EVM address bytes
-//       match_addrs    : address -> prefix/suffix match
+// Portability notes — what each kernel needs from the host OpenCL runtime:
+//   * Apple OpenCL 1.2 (Intel UHD 630 / AMD Radeon Pro 560X on macOS):
+//       - The compiler mishandles dynamic indexing into file-scope `constant`
+//         arrays, so keccak_f keeps its round constants as function-local
+//         `const`.
+//       - The 64-bit rotate() builtin is mis-compiled on the Radeon driver,
+//         so we use a manual rotl64() definition.
+//       - Affine scalar multiplication needs one modular inverse per point
+//         operation; on the Intel UHD 630 that exceeds the macOS display-GPU
+//         watchdog for private keys with many 1-bits. We therefore use
+//         Jacobian projective coordinates: doubling and addition need no
+//         inverses, and only the final conversion back to affine performs a
+//         single inverse.
+//       - On the AMD Radeon Pro 560X, the default `scalar_mul()` kernel
+//         crashes the Apple OpenCL compiler inside
+//         `cvms_element_build_from_source`. As a macOS-only workaround the
+//         multi-dispatch kernels radeon_init_inf / radeon_step_bit /
+//         radeon_finalize_affine move the 256 iteration loop into the host.
+//         They are gated by `--radeon-self-test` and are NOT used by the
+//         default search path. Do not enable them on Windows.
+//       - scalar_mul() and keccak256_addr() were historically cross-optimized
+//         incorrectly on Radeon, so we keep a three-pass pipeline connected by
+//         global scratch buffers:
+//           derive_pubkeys : key -> (Qx, Qy)
+//           hash_addrs     : (Qx, Qy) -> EVM address bytes
+//           match_addrs    : address -> prefix/suffix match
+//   * Windows OpenCL (AMD Adrenalin / NVIDIA CUDA / Intel oneAPI):
+//       - The vendor compilers (AMD 25.x, CUDA, Intel) compile this kernel
+//         as-is. Jacobian single-kernel path is the fastest path on Windows
+//         discrete GPUs (e.g. AMD Radeon RX 6000/7000, NVIDIA RTX). No
+//         macOS-only workaround is needed.
+//   * Linux OpenCL (Mesa / ROCm / NVIDIA):
+//       - Same as Windows — the default path is correct and fastest.
 //
 // The host re-derives every candidate address on the CPU, so a buggy kernel can
 // never emit a mismatched private key/address pair.
@@ -449,6 +466,133 @@ static void scalar_mul(uint* Qx, uint* Qy, const uint* k) {
     }
 
     jto_affine(Qx, Qy, RX, RY, RZ);
+}
+
+// ---- Radeon-friendly multi-dispatch scalar multiplication -----------------
+//
+// This is an EXPERIMENTAL path, gated off by default in the host (see
+// gpu.rs `radeon_scalar_mul`). The Apple OpenCL 1.2 / AMD Radeon driver
+// (cvms) crashes (`cvms_element_build_from_source`) when it statically
+// unrolls the 256-iteration double-and-add loop in `scalar_mul` and inlines
+// the Jacobian helpers past its internal limit. Empirical binary search in
+// the diagnostic examples showed a SINGLE function call per kernel is fine
+// (256x a single `jdouble` builds), but any two calls per iteration
+// (`jdouble`+`jadd`, or 2x `jdouble`) blows up.
+//
+// Workaround: move the loop OUT of the kernel. The host drives 256 dispatches,
+// each invoking `step_bit` exactly once (no loop, one outer call). The running
+// Jacobian point is kept in a global scratch buffer `pubs` (3*8 = 24 uints per
+// work-item: RX, RY, RZ). This is mathematically identical to `scalar_mul()`.
+//
+// These kernels are appended to the same source file so they are always
+// compiled (they compile fine on every driver); only the *host dispatch path*
+// is gated. Keeping them compiled means `--self-test` can exercise them too.
+
+// Initialize pubs to the Jacobian point at infinity (RZ = 0, RX=RY=1).
+__kernel void radeon_init_inf(__global uint* pubs) {
+    size_t gid = get_global_id(0);
+    size_t off = gid * 24;
+    for (int i = 0; i < 8; i++) {
+        pubs[off + i]      = 0; // RX
+        pubs[off + 8 + i]  = 0; // RY
+        pubs[off + 16 + i] = 0; // RZ
+    }
+    // RX = RY = 1, RZ = 0 -> infinity marker
+    pubs[off + 7] = 1;
+    pubs[off + 8 + 7] = 1;
+}
+
+// Process one bit (bit_index in [0,255], MSB first) of each key.
+// bit_index 0 -> k[0] bit 31, bit_index 255 -> k[7] bit 0.
+// `bit_index` is passed via a 1-element global buffer (written by the host per
+// dispatch) rather than a scalar arg, because some OpenCL runtimes do not
+// reliably re-read a scalar argument value that is mutated between dispatches.
+__kernel void radeon_step_bit(__global uint* pubs, __global uint* base, __global int* bit_index) {
+    int bit_index_local = bit_index[0];
+    size_t gid = get_global_id(0);
+    size_t off = gid * 24;
+
+    uint key[8];
+    for (int i = 0; i < 8; i++) key[i] = base[i];
+    uint64_t carry = (uint64_t)gid;
+    for (int i = 7; i >= 0 && carry; i--) {
+        uint64_t s = (uint64_t)key[i] + carry;
+        key[i] = (uint)s;
+        carry = s >> 32;
+    }
+
+    int limb = bit_index / 32;
+    int bit  = 31 - (bit_index % 32);
+    uint kb = (key[limb] >> bit) & 1u;
+
+    uint RX[8], RY[8], RZ[8];
+    for (int i = 0; i < 8; i++) {
+        RX[i] = pubs[off + i];
+        RY[i] = pubs[off + 8 + i];
+        RZ[i] = pubs[off + 16 + i];
+    }
+
+    // double
+    uint TX[8], TY[8], TZ[8];
+    jdouble(TX, TY, TZ, RX, RY, RZ);
+    for (int t = 0; t < NL; t++) { RX[t] = TX[t]; RY[t] = TY[t]; RZ[t] = TZ[t]; }
+
+    if (kb) {
+        // add G (affine, constant memory)
+        uint qx[8], qy[8];
+        for (int i = 0; i < NL; i++) { qx[i] = GX[i]; qy[i] = GY[i]; }
+        if (fe_is_zero(RZ)) {
+            for (int i = 0; i < NL; i++) { RX[i] = qx[i]; RY[i] = qy[i]; }
+            uint one[8] = {0,0,0,0,0,0,0,1};
+            for (int i = 0; i < NL; i++) RZ[i] = one[i];
+        } else {
+            uint z2[8], z3[8], u2[8], s2[8], h[8], rr[8];
+            fe_sqr(z2, RZ); fe_mul(z3, z2, RZ);
+            fe_mul(u2, qx, z2); fe_mul(s2, qy, z3);
+            fe_sub_mod(h, u2, RX); fe_sub_mod(rr, s2, RY);
+            if (fe_is_zero(h)) {
+                uint one[8] = {0,0,0,0,0,0,0,1};
+                for (int i = 0; i < NL; i++) { RX[i] = one[i]; RY[i] = one[i]; }
+                RZ[7] = 0;
+            } else {
+                uint h2[8], h3[8], u1h2[8], t1[8], t2[8];
+                fe_sqr(h2, h); fe_mul(h3, h2, h); fe_mul(u1h2, RX, h2);
+                fe_sqr(t1, rr); fe_sub_mod(t2, t1, h3);
+                fe_add(t1, u1h2, u1h2); fe_sub_mod(TX, t2, t1);
+                fe_sub_mod(t1, u1h2, RX); fe_mul(t2, rr, t1);
+                fe_mul(t1, qy, h3); fe_sub_mod(TY, t2, t1);
+                fe_mul(TZ, RZ, h);
+                for (int i = 0; i < NL; i++) { RX[i] = TX[i]; RY[i] = TY[i]; RZ[i] = TZ[i]; }
+            }
+        }
+    }
+
+    for (int i = 0; i < 8; i++) {
+        pubs[off + i]      = RX[i];
+        pubs[off + 8 + i]  = RY[i];
+        pubs[off + 16 + i] = RZ[i];
+    }
+}
+
+// Convert the Jacobian point in pubs to affine (Qx,Qy) written at off..16,
+// matching the layout produced by derive_pubkeys (so hash_addrs can reuse it).
+__kernel void radeon_finalize_affine(__global uint* pubs) {
+    size_t gid = get_global_id(0);
+    size_t off = gid * 24;
+
+    uint RX[8], RY[8], RZ[8];
+    for (int i = 0; i < 8; i++) {
+        RX[i] = pubs[off + i];
+        RY[i] = pubs[off + 8 + i];
+        RZ[i] = pubs[off + 16 + i];
+    }
+    uint Qx[8], Qy[8];
+    jto_affine(Qx, Qy, RX, RY, RZ);
+    size_t aoff = gid * 16;
+    for (int i = 0; i < 8; i++) {
+        pubs[aoff + i]      = Qx[i];
+        pubs[aoff + 8 + i]  = Qy[i];
+    }
 }
 
 // ---- keccak-256 ----------------------------------------------------------

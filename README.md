@@ -35,6 +35,50 @@ GPU 路径需要系统有 OpenCL：
 - **Linux**：装 ICD 与驱动头 —— `apt install ocl-icd-opencl-dev`，再装对应显卡驱动（如 NVIDIA 的 `nvidia-opencl-icd`、AMD 的 `rocm-opencl-icd` / `mesa-opencl-icd`）。
 - **Windows**：安装显卡厂商的 OpenCL 运行时（NVIDIA CUDA SDK / AMD ADL 或 Intel 驱动），并把 `OpenCL.dll` 所在目录加入 `PATH`；`--self-test` 会在有设备时报 PASS。
 
+> **直接取构建好的 `.exe`（最省事）**：CI（`.github/workflows/ci.yml` 的 `windows-msvc-build` job）每次 push 都把 `vanity-evm-gpu.exe` 与 `vanity-evm-gui.exe` 作为 artifact 上传；点 tag（`vX.Y.Z`）还会自动挂到 GitHub Release。Windows 11 用户直接下 .exe，不用在本机装 Rust。
+
+### Windows 11 + AMD Radeon RX 6750 GRE（推荐路径）
+
+这台配置（2026 年典型装机，i5-12400F + 6750 GRE 10GB GDDR6 + Win11）是 OpenCL **最稳**的目标之一，不需要任何 workaround：
+
+1. **装 OpenCL ICD**（已装 AMD Software: Adrenalin 的可跳过）：
+   * **首选**：直接装 [AMD Software: Adrenalin Edition](https://www.amd.com/en/support)（自动带 `amdocl.dll` OpenCL ICD）。
+   * **不想装全家桶**：单独装 AMD OpenCL 运行时（`AMD-OpenCL-ICD` 或 [Khronos OpenCL ICD](https://www.khronos.org/opencl/resources)）也行。
+   * 装完开 PowerShell，`clinfo` 或自己写一行确认 ICD 可见（见下面的「验证 OpenCL」）。
+2. **构建/取二进制**（选其一）：
+   * **下 artifact**：到 [GitHub Actions](https://github.com/7day1/vanity-evm-gpu/actions) → 选一次成功的 Windows-MSVC-build run → 底部 Artifacts 下 `vanity-evm-gpu-windows-x64`，解压得到两个 `.exe`。
+   * **本地构建**（要装 Rust + MSVC）：见上方 `构建` 一节，rustup 默认 toolchain 已经是 `stable-x86_64-pc-windows-msvc`。
+3. **验证 OpenCL 已被正确识别**（首次必做）：
+   ```powershell
+   cd path\to\release
+   .\vanity-evm-gpu.exe --list-devices
+   # 期望看到：[0] AMD Radeon RX 6750 GRE  (auto default)
+   ```
+4. **验证 GPU 内核与 CPU 参考一致**（首次必做，1–2 分钟）：
+   ```powershell
+   .\vanity-evm-gpu.exe --self-test
+   # 期望最后一行：[self-test] PASS — GPU kernel matches CPU reference.
+   ```
+5. **跑 10 秒速率基线**（不落盘、不产出候选）：
+   ```powershell
+   .\vanity-evm-gpu.exe --benchmark 10
+   # 期望看到 [benchmark] XX.XXMkeys/s over 10s (GPU, batch=4096)
+   ```
+   6750 GRE 上 `--batch 65536` 通常能榨到 100–250 Mkeys/s（默认 4096 偏保守，可拉大），先小 batch 验证稳定性再调高。
+6. **要 GUI？** 双击 `vanity-evm-gui.exe`，或 `scripts\win\run-gui.bat` 一键拉起（设备下拉框已列 6750 GRE，先点「自检 (Self-Test)」，再填前缀/后缀开始）。
+
+**Win11 上的安全提示**：GPU 候选会被强制 CPU 复核（见 [安全须知](#安全须知生成真实钱包前必读)）；首次跑通 `--self-test` 之前不要把任何真地址发到外面。
+
+#### 常见坑
+
+| 现象 | 原因 / 修法 |
+|---|---|
+| `--list-devices` 报 `no OpenCL GPU devices found` | 没装 AMD Software / OpenCL ICD。装 [AMD Software: Adrenalin](https://www.amd.com/en/support) 重启后再试 |
+| `--self-test` 失败但 `--list-devices` 能看到卡 | 极少见，多为驱动 Bug。装最新 AMD Software；仍然失败则加 `--cpu` 强制 CPU 后端跑，功能不变但慢 |
+| 报缺 `vcruntime140.dll` | 装 [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)（装 Rust + MSVC 工具链一般已经带上） |
+| GUI 启动后黑屏 / 报缺 `XAML` | 极少；右键 `vanity-evm-gui.exe` → 属性 → 兼容性，勾「禁用显示缩放」 |
+| `--batch` 设到 1<<20+ 后 hang | 任何 GPU 都看门狗；遇到 hang 加 `--max-seconds 30` 让它自动退出，batch 降到 65536 重试 |
+
 CPU 路径无需 OpenCL。
 
 ## GUI（窗口界面）

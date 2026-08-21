@@ -54,6 +54,8 @@ struct GuiState {
     /// Set by the Stop button; the background thread's ProgressCb returns
     /// `false` once this flips, cancelling the search loop.
     stop_requested: bool,
+    /// Result of the last GPU self-test ("PASS" / "FAIL" / message), if run.
+    self_test_result: Option<String>,
 }
 
 impl Default for GuiState {
@@ -69,6 +71,7 @@ impl Default for GuiState {
             result: None,
             redact: false,
             stop_requested: false,
+            self_test_result: None,
         }
     }
 }
@@ -87,10 +90,15 @@ struct VanityApp {
     device_sel: String,
     /// Status line shown near the controls (parsed-error / hints).
     notice: String,
+    /// Available OpenCL GPU devices (refreshed on app start), for the dropdown.
+    gpu_devices: Vec<(usize, String)>,
+    /// Index into `gpu_devices` the user picked; `None` means "auto".
+    device_index: Option<usize>,
 }
 
 impl Default for VanityApp {
     fn default() -> Self {
+        let gpu_devices = gpu::list_gpus();
         Self {
             state: Arc::new(Mutex::new(GuiState::default())),
             prefix: String::new(),
@@ -100,6 +108,8 @@ impl Default for VanityApp {
             redact: false,
             device_sel: "auto".to_string(),
             notice: String::new(),
+            gpu_devices,
+            device_index: None,
         }
     }
 }
@@ -126,15 +136,36 @@ impl eframe::App for VanityApp {
             });
             ui.horizontal(|ui| {
                 ui.label("GPU 设备:");
-                ui.text_edit_singleline(&mut self.device_sel);
-                ui.label("(auto / 序号 / 名称子串)");
+                // Dropdown: "自动 (auto)" plus each detected device.
+                let combo_label = match self.device_index {
+                    Some(i) => self
+                        .gpu_devices
+                        .iter()
+                        .find(|(idx, _)| *idx == i)
+                        .map(|(_, n)| n.clone())
+                        .unwrap_or_else(|| "自动 (auto)".to_string()),
+                    None => "自动 (auto)".to_string(),
+                };
+                egui::ComboBox::from_label("")
+                    .selected_text(combo_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.device_index, None, "自动 (auto)");
+                        for (i, name) in &self.gpu_devices {
+                            ui.selectable_value(&mut self.device_index, Some(*i), name.clone());
+                        }
+                    });
+                // Keep device_sel in sync for the worker thread.
+                self.device_sel = match self.device_index {
+                    Some(i) => i.to_string(),
+                    None => "auto".to_string(),
+                };
             });
             ui.checkbox(&mut self.force_cpu, "强制 CPU 模式 (跳过 GPU 探测)");
             ui.checkbox(&mut self.redact, "隐藏私钥 (redact)");
 
             ui.separator();
 
-            // ---- start / stop ----
+            // ---- start / stop / self-test ----
             let (running, can_stop) = {
                 let s = self.state.lock().unwrap();
                 (s.running, s.stop_requested)
@@ -151,6 +182,15 @@ impl eframe::App for VanityApp {
                 } else {
                     ui.label("○ 空闲");
                 }
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!running, egui::Button::new("自检 (Self-Test)"))
+                    .clicked()
+                {
+                    self.run_self_test();
+                }
+                ui.label("只验证 GPU，不搜索（新手安全演练）");
             });
 
             if !self.notice.is_empty() {
@@ -218,6 +258,24 @@ impl eframe::App for VanityApp {
                 ui.colored_label(egui::Color32::RED, format!("错误/提示: {}", msg));
             }
 
+            // ---- self-test result ----
+            let self_test_result = {
+                let s = self.state.lock().unwrap();
+                s.self_test_result.clone()
+            };
+            if let Some(res) = self_test_result {
+                ui.separator();
+                let pass = res.starts_with("PASS");
+                let color = if pass {
+                    egui::Color32::from_rgb(40, 160, 60)
+                } else if res.starts_with("FAIL") {
+                    egui::Color32::RED
+                } else {
+                    egui::Color32::GRAY
+                };
+                ui.colored_label(color, format!("自检结果: {}", res));
+            }
+
             // ---- result ----
             if let Some((addr, priv32)) = result {
                 ui.separator();
@@ -234,6 +292,16 @@ impl eframe::App for VanityApp {
                         hex.push_str(&format!("{:02x}", b));
                     }
                     ui.monospace(format!("PrivateKey: 0x{}", hex.as_str()));
+                    // One-click copy to clipboard (arboard) to avoid manual
+                    // selection errors with the long hex strings.
+                    ui.horizontal(|ui| {
+                        if ui.button("复制地址").clicked() {
+                            let _ = copy_to_clipboard(&format!("0x{}", addr));
+                        }
+                        if ui.button("复制私钥").clicked() {
+                            let _ = copy_to_clipboard(&format!("0x{}", hex.as_str()));
+                        }
+                    });
                 }
                 ui.label(
                     "⚠️ 充值前请独立用 ethers/web3.py/alloy 从私钥重推地址，核对 EIP-55 一致。",
@@ -294,6 +362,34 @@ impl VanityApp {
         thread::spawn(move || {
             run_search(&prefix, &suffix, max_seconds, force_cpu, &device_sel, state);
         });
+    }
+
+    /// Spawn a background thread that runs `gpu::self_test` (validate the GPU
+    /// kernel against the CPU reference without searching) and records the
+    /// result into `state.self_test_result`. This is the GUI equivalent of the
+    /// CLI's `--self-test` / `--dry-run` for safe beginner practice.
+    fn run_self_test(&mut self) {
+        self.notice.clear();
+        let device_sel = self.device_sel.trim().to_string();
+        let state = self.state.clone();
+        thread::spawn(move || {
+            let device = parse_device(&device_sel);
+            let ok = gpu::self_test(device);
+            let mut s = state.lock().unwrap();
+            s.self_test_result = Some(if ok {
+                "PASS — GPU 内核与 CPU 参考一致".to_string()
+            } else {
+                "FAIL — 该设备 GPU 结果不可信，请勿使用".to_string()
+            });
+        });
+    }
+}
+
+/// Copy a string to the system clipboard using `arboard`.
+fn copy_to_clipboard(text: &str) -> bool {
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => cb.set_text(text.to_string()).is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -491,6 +587,7 @@ mod tests {
             }),
             redact: false,
             stop_requested: true,
+            self_test_result: None,
         };
         // The reset path overwrites the whole struct; the old `result` is
         // dropped (and zeroized by ZeroizeOnDrop) rather than carried over.
