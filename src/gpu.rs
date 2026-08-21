@@ -1,0 +1,907 @@
+//! OpenCL backend: auto-detect a GPU (fall back to any device), brute-force on
+//! the device, and re-derive the candidate's address on the CPU before
+//! accepting it. Includes `--self-test` to validate the kernel against the CPU.
+
+use crate::config::Pattern;
+use crate::crypto::{
+    add_u64_be, bytes_to_u32x8, privkey_to_address, reduce_mod_n, u32x8_to_bytes, zeroize_key,
+};
+use crate::progress::{Progress, ProgressCb};
+use ocl::{Buffer, Device, DeviceType, Platform, ProQue, SpatialDims};
+use rand::rngs::OsRng;
+use rand::RngCore;
+use zeroize::ZeroizeOnDrop;
+
+/// Result of a GPU match. Zeroized on drop (defense-in-depth).
+#[derive(ZeroizeOnDrop)]
+pub struct GpuMatch {
+    pub priv32: [u8; 32], // canonical (reduced mod n)
+    pub addr: [u8; 20],
+}
+
+/// Known EVM address for the private key 1 (used as a fast probe).
+const ADDR_KEY1: [u8; 20] = [
+    0x7e, 0x5f, 0x45, 0x52, 0x09, 0x1a, 0x69, 0x12, 0x5d, 0x5d, 0xfc, 0xb7, 0xb8, 0xc2, 0x65, 0x90,
+    0x29, 0x39, 0x5b, 0xdf,
+];
+
+/// OpenCL C prelude prepended to the kernel at compile time.
+const KERNEL_PRELUDE: &str = r#"
+typedef char           int8_t;
+typedef unsigned char  uint8_t;
+typedef short          int16_t;
+typedef unsigned short uint16_t;
+typedef int            int32_t;
+typedef unsigned int   uint32_t;
+typedef long           int64_t;
+typedef unsigned long  uint64_t;
+"#;
+
+fn kernel_source() -> String {
+    let mut s = String::with_capacity(KERNEL_PRELUDE.len() + crate::KERNEL_SRC.len());
+    s.push_str(KERNEL_PRELUDE);
+    s.push_str(crate::KERNEL_SRC);
+    s
+}
+
+pub fn diagnose_opencl() {
+    let platforms = Platform::list();
+    eprintln!("[gpu] clGetPlatformIDs -> {} platform(s)", platforms.len());
+    for (i, p) in platforms.iter().enumerate() {
+        let name = p.name().unwrap_or_else(|_| "<unknown>".into());
+        let vendor = p.vendor().unwrap_or_else(|_| "<unknown>".into());
+        let version = p.version().unwrap_or_else(|_| "<unknown>".into());
+        eprintln!(
+            "[gpu]   platform[{}]: name='{}' vendor='{}' version='{}'",
+            i, name, vendor, version
+        );
+        for (label, dt) in [
+            ("GPU", Some(DeviceType::GPU)),
+            ("ALL", None),
+            ("CPU", Some(DeviceType::CPU)),
+        ] {
+            match Device::list(p, dt) {
+                Ok(devs) => {
+                    eprintln!(
+                        "[gpu]     {:<3} filter -> {} device(s): {}",
+                        label,
+                        devs.len(),
+                        devs.iter().map(device_name).collect::<Vec<_>>().join(", ")
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[gpu]     {:<3} filter -> ERROR: {}", label, e);
+                }
+            }
+        }
+        if let Ok(devs) = Device::list(p, None) {
+            let src = kernel_source();
+            for d in devs {
+                match ProQue::builder()
+                    .platform(*p)
+                    .device(d)
+                    .src(src.as_str())
+                    .build()
+                {
+                    Ok(_) => eprintln!("[gpu]     build ProQue on '{}': OK", device_name(&d)),
+                    Err(e) => eprintln!(
+                        "[gpu]     build ProQue on '{}': ERROR: {}",
+                        device_name(&d),
+                        e
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn is_preferred_gpu(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("radeon")
+        || n.contains("nvidia")
+        || n.contains("geforce")
+        || n.contains("rx ")
+        || n.contains("gtx")
+        || n.contains("rtx")
+        || n.contains("discrete")
+        || n.contains("amd")
+        || n.contains("firepro")
+        || n.contains("quadro")
+        || n.contains("arc ")
+        || n.contains("intel(r) arc")
+}
+
+pub fn list_gpus() -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for p in Platform::list() {
+        if let Ok(devs) = Device::list(p, Some(DeviceType::GPU)) {
+            for d in devs {
+                out.push((out.len(), device_name(&d)));
+            }
+        }
+    }
+    out
+}
+
+fn build_proque(platform: Platform, device: ocl::Device) -> Option<ProQue> {
+    let src = kernel_source();
+    // Note: the AMD Radeon Pro 560X on this Mac fails to build the current
+    // Jacobian kernel regardless of optimization settings
+    // ("cvms_element_build_from_source"). The runtime probe automatically skips
+    // any device that does not build or that produces wrong results, so we
+    // simply use the default compiler flags for all devices.
+    ProQue::builder()
+        .platform(platform)
+        .device(device)
+        .src(src.as_str())
+        .build()
+        .ok()
+}
+
+/// Probe a single private-key vector on the already-built buffers/kernels.
+/// `base_u32` is the 256-bit private key in big-endian u32 chunks. The work
+/// size is always 1, so gid=0 and the probed key equals `base_u32`.
+fn probe_one_vector(
+    proque: &ProQue,
+    derive: &ocl::Kernel,
+    hash: &ocl::Kernel,
+    base_buf: &Buffer<u32>,
+    addrs: &Buffer<u8>,
+    base_u32: &[u32; 8],
+    expected: &[u8; 20],
+) -> bool {
+    if base_buf.write(&base_u32[..]).enq().is_err() {
+        return false;
+    }
+    if proque.queue().finish().is_err() {
+        return false;
+    }
+    unsafe {
+        if derive
+            .cmd()
+            .global_work_size(SpatialDims::One(1))
+            .enq()
+            .is_err()
+        {
+            return false;
+        }
+    }
+    if proque.queue().finish().is_err() {
+        return false;
+    }
+    unsafe {
+        if hash
+            .cmd()
+            .global_work_size(SpatialDims::One(1))
+            .enq()
+            .is_err()
+        {
+            return false;
+        }
+    }
+    if proque.queue().finish().is_err() {
+        return false;
+    }
+    let mut got = [0u8; 20];
+    if addrs.read(&mut got[..]).enq().is_err() {
+        return false;
+    }
+    if proque.queue().finish().is_err() {
+        return false;
+    }
+    got == *expected
+}
+
+/// Kernel/device reliability probe.
+///
+/// The Apple/Radeon Pro 560X driver historically miscompiled the affine
+/// scalar-multiplication path for non-trivial private keys, even though the
+/// trivial key=1 (the generator itself) happened to pass. With the Jacobian
+/// kernel this should no longer happen, but we keep a multi-vector probe as a
+/// runtime safety net so any driver-level regression is caught before we trust
+/// the device.
+fn probe_device(proque: &ProQue) -> bool {
+    let base_buf = match Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(8)
+        .build()
+    {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let pubs = match Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(16)
+        .build()
+    {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let addrs = match Buffer::<u8>::builder()
+        .queue(proque.queue().clone())
+        .len(20)
+        .build()
+    {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let derive = match proque
+        .kernel_builder("derive_pubkeys")
+        .arg(&base_buf)
+        .arg(&pubs)
+        .build()
+    {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let hash = match proque
+        .kernel_builder("hash_addrs")
+        .arg(&pubs)
+        .arg(&addrs)
+        .build()
+    {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+
+    // Vector 0: private key 1.
+    let mut base1 = [0u32; 8];
+    base1[7] = 1;
+    if !probe_one_vector(
+        proque, &derive, &hash, &base_buf, &addrs, &base1, &ADDR_KEY1,
+    ) {
+        return false;
+    }
+
+    // Diagnostic vectors: key=2 (tests Jacobian doubling), key=3 (tests
+    // doubling + mixed addition). Keep these even in release until we are sure
+    // the Jacobian path is solid.
+    for (v, k) in [(1u32, 2u8), (2, 3)].iter() {
+        let mut bytes = [0u8; 32];
+        bytes[31] = *k;
+        let base = bytes_to_u32x8(&bytes);
+        let expected = privkey_to_address(&bytes).unwrap();
+        if !probe_one_vector(proque, &derive, &hash, &base_buf, &addrs, &base, &expected) {
+            eprintln!("[gpu] probe vector {} (key={}): GPU/CPU mismatch", v, k);
+            return false;
+        }
+    }
+
+    // Vectors 3..N: random private keys. Non-trivial scalars exercise the
+    // full Jacobian double/add path, which is the real reliability gate.
+    let mut rng = OsRng;
+    const RANDOM_VECTORS: usize = 4;
+    for v in 3..=RANDOM_VECTORS + 2 {
+        let mut bytes = [0u8; 32];
+        rng.fill_bytes(&mut bytes);
+        let base = bytes_to_u32x8(&bytes);
+        let expected = match privkey_to_address(&bytes) {
+            Some(a) => a,
+            None => {
+                eprintln!(
+                    "[gpu] probe vector {}: CPU reference failed (invalid scalar)",
+                    v
+                );
+                return false;
+            }
+        };
+        if !probe_one_vector(proque, &derive, &hash, &base_buf, &addrs, &base, &expected) {
+            eprintln!("[gpu] probe vector {}: GPU/CPU mismatch", v);
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Internal implementation of device selection. `quiet` suppresses the
+/// per-device probe messages (used by `gpu_available()`).
+fn try_select_device(selection: DeviceSelection, quiet: bool) -> Option<(ProQue, ocl::Device)> {
+    let mut gpus: Vec<(Platform, ocl::Device, String)> = Vec::new();
+    for p in Platform::list() {
+        if let Ok(devs) = Device::list(p, Some(DeviceType::GPU)) {
+            for d in devs {
+                gpus.push((p, d, device_name(&d)));
+            }
+        }
+    }
+    let candidates: Vec<(Platform, ocl::Device, String)> = match selection {
+        DeviceSelection::Auto => {
+            // Prefer discrete GPUs first, but still probe all of them.
+            let mut preferred: Vec<_> = gpus
+                .iter()
+                .filter(|(_, _, n)| is_preferred_gpu(n))
+                .cloned()
+                .collect();
+            let mut rest: Vec<_> = gpus
+                .iter()
+                .filter(|(_, _, n)| !is_preferred_gpu(n))
+                .cloned()
+                .collect();
+            preferred.append(&mut rest);
+            preferred
+        }
+        DeviceSelection::Index(i) => gpus.into_iter().skip(i).take(1).collect(),
+        DeviceSelection::Name(sub) => {
+            let sub = sub.to_ascii_lowercase();
+            gpus.into_iter()
+                .filter(|(_, _, n)| n.to_ascii_lowercase().contains(&sub))
+                .take(1)
+                .collect()
+        }
+    };
+    for (p, d, name) in candidates {
+        if !quiet {
+            eprintln!("[gpu] probing device: {}", name);
+        }
+        if let Some(proque) = build_proque(p, d) {
+            if probe_device(&proque) {
+                if !quiet {
+                    eprintln!("[gpu] selected reliable device: {}", name);
+                }
+                return Some((proque, d));
+            } else if !quiet {
+                eprintln!(
+                    "[gpu] device {} failed probe (kernel/CPU mismatch) — skipping",
+                    name
+                );
+            }
+        }
+    }
+    if !quiet {
+        eprintln!("[gpu] no reliable GPU device found");
+    }
+    None
+}
+
+/// Pick a GPU according to `selection` and verify it produces correct results.
+/// For `Auto`, every GPU is probed in order and the first reliable one wins.
+pub fn select_device(selection: DeviceSelection) -> Option<(ProQue, ocl::Device)> {
+    try_select_device(selection, false)
+}
+
+/// True if at least one OpenCL GPU passes the reliability probe. This is the
+/// same path `select_device` uses, so `gpu_available()` and the actual GPU run
+/// always agree on whether a device is trustworthy.
+pub fn gpu_available() -> bool {
+    try_select_device(DeviceSelection::Auto, true).is_some()
+}
+
+/// How the GPU device is chosen.
+#[derive(Debug, Clone, Default)]
+pub enum DeviceSelection {
+    /// Prefer a reliable discrete GPU, else any reliable GPU.
+    #[default]
+    Auto,
+    /// N-th GPU in `list_gpus()` order.
+    Index(usize),
+    /// First GPU whose name contains this substring (case-insensitive).
+    Name(String),
+}
+
+fn device_name(dev: &ocl::Device) -> String {
+    dev.name()
+        .unwrap_or_else(|_| "<unknown device>".to_string())
+}
+
+fn make_params(base: &[u32; 8], pattern: &Pattern) -> Vec<u32> {
+    let mut p = vec![0u32; 90];
+    p[0] = pattern.prefix.len() as u32;
+    p[1] = pattern.suffix.len() as u32;
+    p[2..10].copy_from_slice(base);
+    for i in 0..pattern.prefix.len().min(40) {
+        p[10 + i] = pattern.prefix[i] as u32;
+    }
+    for i in 0..pattern.suffix.len().min(40) {
+        p[50 + i] = pattern.suffix[i] as u32;
+    }
+    p
+}
+
+pub fn run_gpu(
+    pattern: &Pattern,
+    max_seconds: Option<u64>,
+    batch: usize,
+    selection: DeviceSelection,
+    dry_run: bool,
+    cb: Option<ProgressCb>,
+) -> Option<GpuMatch> {
+    let (proque, dev) = select_device(selection)?;
+    let dev_name = device_name(&dev);
+    eprintln!("[gpu] using device: {}", dev_name);
+    if let Some(cb) = &cb {
+        cb(&Progress {
+            backend: "GPU",
+            device: dev_name.clone(),
+            attempts: 0,
+            rate: 0.0,
+            elapsed_secs: 0.0,
+            done: false,
+        });
+    }
+
+    let base_buf = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(8)
+        .build()
+        .ok()?;
+    let pubs = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(batch * 16)
+        .build()
+        .ok()?;
+    let addrs = Buffer::<u8>::builder()
+        .queue(proque.queue().clone())
+        .len(batch * 20)
+        .build()
+        .ok()?;
+    let out_found = Buffer::<i32>::builder()
+        .queue(proque.queue().clone())
+        .len(1)
+        .build()
+        .ok()?;
+    let out_priv = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(8)
+        .build()
+        .ok()?;
+    let out_addr = Buffer::<u8>::builder()
+        .queue(proque.queue().clone())
+        .len(20)
+        .build()
+        .ok()?;
+    let params = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(90)
+        .build()
+        .ok()?;
+
+    let derive = proque
+        .kernel_builder("derive_pubkeys")
+        .arg(&base_buf)
+        .arg(&pubs)
+        .build()
+        .ok()?;
+    let hash = proque
+        .kernel_builder("hash_addrs")
+        .arg(&pubs)
+        .arg(&addrs)
+        .build()
+        .ok()?;
+    let matcher = proque
+        .kernel_builder("match_addrs")
+        .arg(&base_buf)
+        .arg(&addrs)
+        .arg(&out_found)
+        .arg(&out_priv)
+        .arg(&out_addr)
+        .arg(&params)
+        .build()
+        .ok()?;
+
+    let mut base_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut base_bytes);
+    let mut base = bytes_to_u32x8(&base_bytes);
+
+    let start = std::time::Instant::now();
+    let deadline = max_seconds.map(std::time::Duration::from_secs);
+    let mut total: u64 = 0;
+
+    loop {
+        if let Some(d) = deadline {
+            if start.elapsed() >= d {
+                break;
+            }
+        }
+        if dry_run && total > 0 {
+            break;
+        }
+
+        let p = make_params(&base, pattern);
+        params.write(&p).enq().ok()?;
+        base_buf.write(&base[..]).enq().ok()?;
+        let zero = [0i32];
+        out_found.write(&zero[..]).enq().ok()?;
+        proque.queue().finish().ok()?;
+
+        unsafe {
+            derive
+                .cmd()
+                .global_work_size(SpatialDims::One(batch))
+                .enq()
+                .ok()?;
+        }
+        proque.queue().finish().ok()?;
+        unsafe {
+            hash.cmd()
+                .global_work_size(SpatialDims::One(batch))
+                .enq()
+                .ok()?;
+        }
+        proque.queue().finish().ok()?;
+        unsafe {
+            matcher
+                .cmd()
+                .global_work_size(SpatialDims::One(batch))
+                .enq()
+                .ok()?;
+        }
+        proque.queue().finish().ok()?;
+
+        let mut found = [0i32; 1];
+        out_found.read(&mut found[..]).enq().ok()?;
+        proque.queue().finish().ok()?;
+
+        if found[0] > 0 {
+            let mut priv_u32 = [0u32; 8];
+            let mut addr = [0u8; 20];
+            out_priv.read(&mut priv_u32[..]).enq().ok()?;
+            out_addr.read(&mut addr[..]).enq().ok()?;
+            proque.queue().finish().ok()?;
+
+            let mut key_bytes = u32x8_to_bytes(&priv_u32);
+            match privkey_to_address(&key_bytes) {
+                Some(cpu_addr) if cpu_addr == addr => {
+                    let reduced = reduce_mod_n(&key_bytes);
+                    let m = GpuMatch {
+                        priv32: reduced,
+                        addr,
+                    };
+                    zeroize_key(&mut key_bytes);
+                    if let Some(cb) = &cb {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        cb(&Progress {
+                            backend: "GPU",
+                            device: dev_name.clone(),
+                            attempts: total,
+                            rate: total as f64 / elapsed.max(1e-6),
+                            elapsed_secs: elapsed,
+                            done: true,
+                        });
+                    }
+                    return Some(m);
+                }
+                _ => {
+                    eprintln!(
+                        "[gpu][WARN] GPU-derived address failed CPU verification. \
+                         Ignoring (possible kernel/driver bug on this device)."
+                    );
+                }
+            }
+        }
+
+        total += batch as u64;
+        if total.is_multiple_of(batch as u64 * 20) {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = total as f64 / elapsed.max(1e-6);
+            eprintln!(
+                "[gpu] device='{}' attempts={} rate={:.2}M/s elapsed={:.0}s",
+                dev_name,
+                total,
+                rate / 1e6,
+                elapsed
+            );
+            if let Some(cb) = &cb {
+                let keep_going = cb(&Progress {
+                    backend: "GPU",
+                    device: dev_name.clone(),
+                    attempts: total,
+                    rate,
+                    elapsed_secs: elapsed,
+                    done: false,
+                });
+                // A `false` return is the front-end's cancellation request
+                // (e.g. the GUI "Stop" button). Break out of the search loop;
+                // the final `done = true` progress is emitted below.
+                if !keep_going {
+                    eprintln!("[gpu] progress callback requested stop — cancelling search");
+                    break;
+                }
+            }
+        }
+
+        let mut bb = u32x8_to_bytes(&base);
+        add_u64_be(&mut bb, batch as u64);
+        base = bytes_to_u32x8(&bb);
+    }
+    if let Some(cb) = &cb {
+        let elapsed = start.elapsed().as_secs_f64();
+        cb(&Progress {
+            backend: "GPU",
+            device: dev_name.clone(),
+            attempts: total,
+            rate: total as f64 / elapsed.max(1e-6),
+            elapsed_secs: elapsed,
+            done: true,
+        });
+    }
+    None
+}
+
+/// Validate the GPU kernel against the CPU reference on the selected device.
+pub fn self_test(selection: DeviceSelection) -> bool {
+    diagnose_opencl();
+    let (proque, dev) = match select_device(selection) {
+        Some(x) => x,
+        None => {
+            eprintln!("[self-test] no reliable OpenCL device available");
+            return false;
+        }
+    };
+    eprintln!("[self-test] device: {}", device_name(&dev));
+
+    let base_buf = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(8)
+        .build()
+        .unwrap();
+    let pubs = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(16)
+        .build()
+        .unwrap();
+    let addrs = Buffer::<u8>::builder()
+        .queue(proque.queue().clone())
+        .len(20)
+        .build()
+        .unwrap();
+    let out_found = Buffer::<i32>::builder()
+        .queue(proque.queue().clone())
+        .len(1)
+        .build()
+        .unwrap();
+    let out_priv = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(8)
+        .build()
+        .unwrap();
+    let out_addr = Buffer::<u8>::builder()
+        .queue(proque.queue().clone())
+        .len(20)
+        .build()
+        .unwrap();
+    let params = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(90)
+        .build()
+        .unwrap();
+
+    let derive = proque
+        .kernel_builder("derive_pubkeys")
+        .arg(&base_buf)
+        .arg(&pubs)
+        .build()
+        .unwrap();
+    let hash = proque
+        .kernel_builder("hash_addrs")
+        .arg(&pubs)
+        .arg(&addrs)
+        .build()
+        .unwrap();
+    let matcher = proque
+        .kernel_builder("match_addrs")
+        .arg(&base_buf)
+        .arg(&addrs)
+        .arg(&out_found)
+        .arg(&out_priv)
+        .arg(&out_addr)
+        .arg(&params)
+        .build()
+        .unwrap();
+
+    let mut rng = OsRng;
+    let trials = 8;
+    for t in 0..trials {
+        let mut base_bytes = [0u8; 32];
+        rng.fill_bytes(&mut base_bytes);
+        let base = bytes_to_u32x8(&base_bytes);
+
+        let cpu_addr = match privkey_to_address(&base_bytes) {
+            Some(a) => a,
+            None => {
+                eprintln!("[self-test] trial {}: CPU derive failed", t);
+                return false;
+            }
+        };
+        let mut prefix = Vec::with_capacity(40);
+        for &b in &cpu_addr {
+            prefix.push((b >> 4) & 0xF);
+            prefix.push(b & 0xF);
+        }
+        let pat = Pattern {
+            prefix: prefix.clone(),
+            suffix: vec![],
+        };
+
+        params.write(&make_params(&base, &pat)).enq().unwrap();
+        base_buf.write(&base[..]).enq().unwrap();
+        let zero = [0i32];
+        out_found.write(&zero[..]).enq().unwrap();
+        proque.queue().finish().unwrap();
+
+        unsafe {
+            derive
+                .cmd()
+                .global_work_size(SpatialDims::One(1))
+                .enq()
+                .unwrap();
+        }
+        proque.queue().finish().unwrap();
+        unsafe {
+            hash.cmd()
+                .global_work_size(SpatialDims::One(1))
+                .enq()
+                .unwrap();
+        }
+        proque.queue().finish().unwrap();
+        unsafe {
+            matcher
+                .cmd()
+                .global_work_size(SpatialDims::One(1))
+                .enq()
+                .unwrap();
+        }
+        proque.queue().finish().unwrap();
+
+        let mut found = [0i32; 1];
+        out_found.read(&mut found[..]).enq().unwrap();
+        proque.queue().finish().unwrap();
+
+        if found[0] != 1 {
+            eprintln!(
+                "[self-test] trial {}: kernel did not find expected match (found={})",
+                t, found[0]
+            );
+            return false;
+        }
+        let mut priv_u32 = [0u32; 8];
+        let mut addr = [0u8; 20];
+        out_priv.read(&mut priv_u32[..]).enq().unwrap();
+        out_addr.read(&mut addr[..]).enq().unwrap();
+        proque.queue().finish().unwrap();
+
+        if addr != cpu_addr {
+            eprintln!("[self-test] trial {}: GPU address != CPU address", t);
+            return false;
+        }
+        let key_bytes = u32x8_to_bytes(&priv_u32);
+        match privkey_to_address(&key_bytes) {
+            Some(a) if a == addr => {}
+            _ => {
+                eprintln!(
+                    "[self-test] trial {}: private key does not derive address",
+                    t
+                );
+                return false;
+            }
+        }
+        eprintln!("[self-test] trial {}: OK", t);
+    }
+    true
+}
+
+pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Option<f64> {
+    let (proque, dev) = select_device(selection)?;
+    let dev_name = device_name(&dev);
+    let impossible = [0x0Fu8; 40];
+    let pat = Pattern {
+        prefix: impossible.to_vec(),
+        suffix: vec![],
+    };
+
+    let base_buf = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(8)
+        .build()
+        .ok()?;
+    let pubs = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(batch * 16)
+        .build()
+        .ok()?;
+    let addrs = Buffer::<u8>::builder()
+        .queue(proque.queue().clone())
+        .len(batch * 20)
+        .build()
+        .ok()?;
+    let out_found = Buffer::<i32>::builder()
+        .queue(proque.queue().clone())
+        .len(1)
+        .build()
+        .ok()?;
+    let out_priv = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(8)
+        .build()
+        .ok()?;
+    let out_addr = Buffer::<u8>::builder()
+        .queue(proque.queue().clone())
+        .len(20)
+        .build()
+        .ok()?;
+    let params = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(90)
+        .build()
+        .ok()?;
+
+    let derive = proque
+        .kernel_builder("derive_pubkeys")
+        .arg(&base_buf)
+        .arg(&pubs)
+        .build()
+        .ok()?;
+    let hash = proque
+        .kernel_builder("hash_addrs")
+        .arg(&pubs)
+        .arg(&addrs)
+        .build()
+        .ok()?;
+    let matcher = proque
+        .kernel_builder("match_addrs")
+        .arg(&base_buf)
+        .arg(&addrs)
+        .arg(&out_found)
+        .arg(&out_priv)
+        .arg(&out_addr)
+        .arg(&params)
+        .build()
+        .ok()?;
+
+    let mut base_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut base_bytes);
+    let mut base = bytes_to_u32x8(&base_bytes);
+
+    params.write(&make_params(&base, &pat)).enq().ok()?;
+
+    let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(seconds.max(1));
+    let mut total: u64 = 0;
+    loop {
+        if start.elapsed() >= deadline {
+            break;
+        }
+        base_buf.write(&base[..]).enq().ok()?;
+        let zero = [0i32];
+        out_found.write(&zero[..]).enq().ok()?;
+        proque.queue().finish().ok()?;
+        unsafe {
+            derive
+                .cmd()
+                .global_work_size(SpatialDims::One(batch))
+                .enq()
+                .ok()?;
+        }
+        proque.queue().finish().ok()?;
+        unsafe {
+            hash.cmd()
+                .global_work_size(SpatialDims::One(batch))
+                .enq()
+                .ok()?;
+        }
+        proque.queue().finish().ok()?;
+        unsafe {
+            matcher
+                .cmd()
+                .global_work_size(SpatialDims::One(batch))
+                .enq()
+                .ok()?;
+        }
+        proque.queue().finish().ok()?;
+        total += batch as u64;
+        let mut bb = u32x8_to_bytes(&base);
+        add_u64_be(&mut bb, batch as u64);
+        base = bytes_to_u32x8(&bb);
+    }
+    let elapsed = start.elapsed().as_secs_f64().max(1e-6);
+    let rate = total as f64 / elapsed;
+    eprintln!(
+        "[benchmark] device='{}' batch={} total={} elapsed={:.1}s rate={:.2}Mkeys/s",
+        dev_name,
+        batch,
+        total,
+        elapsed,
+        rate / 1e6
+    );
+    Some(rate)
+}

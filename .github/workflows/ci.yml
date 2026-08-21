@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenCL headers (tests don't need a real GPU)
+        run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Build GUI binary (release)
+        # The egui/eframe front-end is a separate binary. Headless CI cannot
+        # open a window, so this step only verifies it compiles cleanly. The
+        # search logic it drives is covered by the CPU smoke test below.
+        run: cargo build --release --bin vanity-evm-gui
+
+      - name: Test (CPU crypto + parsing; no GPU required)
+        run: cargo test --release
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: CPU smoke (no GPU required)
+        # End-to-end sanity on the pure-CPU backend: a single dry-run dispatch
+        # must complete without hang and exit 0. This is the release gate
+        # baseline independent of any GPU being present in CI.
+        run: ./target/release/vanity-evm-gpu --prefix cafe --cpu --dry-run

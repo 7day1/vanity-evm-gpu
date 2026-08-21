@@ -1,0 +1,26 @@
+[package]
+name = "vanity-evm-gpu"
+version = "0.1.0"
+edition = "2021"
+description = "EVM vanity address generator with auto-adaptive GPU (OpenCL) acceleration, CPU verification oracle, wallet-unbound, local private keys."
+license = "MIT"
+repository = "https://github.com/<your-account>/vanity-evm-gpu"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+secp256k1 = { version = "0.28", features = ["rand", "alloc"] }
+sha3 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+ocl = "0.19"
+eframe = "0.27"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+num-bigint = "0.4"
+num-traits = "0.2"
