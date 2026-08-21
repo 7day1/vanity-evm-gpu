@@ -171,6 +171,13 @@ cargo build --release
 # 注意：Apple 核显有看门狗，batch 过大（如 4194304）会 GPU hang；默认 4096 已调小，难任务请配合 --max-seconds 分多次跑
 ./target/release/vanity-evm-gpu --suffix 88888888
 
+# 一次搜索同时匹配多个后缀（8个8 或 8个7）—— 一条命令、一次搜索
+# 所有 --suffixes 必须与 --suffix 等长；命中后输出会标明命中的是 group 0 (88888888) 还是 group 1 (77777777)
+./target/release/vanity-evm-gpu --suffix 88888888 --suffixes 77777777
+
+# 想同时收 8个8 / 8个7 / 8个6，继续加逗号分隔即可（最多 16 组）
+./target/release/vanity-evm-gpu --suffix 88888888 --suffixes 77777777,66666666
+
 # 跑 30 秒纯速率基准（不落盘、不产出候选）
 ./target/release/vanity-evm-gpu --benchmark 30
 
@@ -190,6 +197,7 @@ cargo build --release
 |---|---|
 | `--prefix` | 地址前缀（hex，按 nibble 值匹配，大小写无关；EIP-55 仅影响显示） |
 | `--suffix` | 地址后缀（hex），**默认空** |
+| `--suffixes` | 额外后缀（逗号分隔 hex）；地址后缀等于 `--suffix` 或任一 `--suffixes` 即命中。各后缀**必须等长**。最多 16 组。一条命令一次搜索匹配多种模式 |
 | `--workers` | CPU 线程数（仅 CPU 模式） |
 | `--batch` | 每次 GPU 派发的 work-items（默认 4,096；Apple 核显看门狗限制，过大易 hang） |
 | `--max-seconds` / `--duration` | 超时停止（秒） |
@@ -201,7 +209,7 @@ cargo build --release
 | `--dry-run` | 单发 GPU 验证后退出，不产出候选 |
 | `--benchmark N` | 跑 N 秒速率基准（Mkeys/s），不落盘 |
 
-> 难度参考：`16^(前缀长度 + 后缀长度)` 次尝试。6 位 ≈ 1600 万（CPU 约 10–20 秒），8 位 ≈ 43 亿（CPU ~1 小时，GPU ~分钟），10 位 ≈ 1.1 万亿（GPU 十几分钟~几小时，CPU 数天）。
+> 难度参考：`16^(前缀长度 + 后缀长度)` 次尝试。6 位 ≈ 1600 万（CPU 约 10–20 秒），8 位 ≈ 43 亿（CPU ~1 小时，GPU ~分钟），10 位 ≈ 1.1 万亿（GPU 十几分钟~几小时，CPU 数天）。使用 `--suffixes` 一次搜 N 个等长后缀时，命中概率约为单后缀的 N 倍，期望耗时约降为 1/N（注意：GPU/CPU 算力被所有组共享，不会变快，只是「更早撞到其中一个」）。
 
 ### 真机 `--self-test` 输出（反面示例：Intel Mac, macOS, Radeon Pro 560X + Intel UHD 630）
 

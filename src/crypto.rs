@@ -136,7 +136,12 @@ pub fn bytes_to_u32x8(b: &[u8; 32]) -> [u32; 8] {
 }
 
 /// Does the address match the nibble-value prefix/suffix? (case = nibble value)
-pub fn addr_matches(addr: &[u8; 20], prefix: &[u8], suffix: &[u8]) -> bool {
+///
+/// `suffixes` holds all suffix groups (group 0 first, then any alternatives).
+/// The address matches if its prefix matches AND its suffix equals ANY one of
+/// the `suffixes` groups. A single-group `suffixes` is identical to the old
+/// `addr_matches(addr, prefix, suffix)` behavior.
+pub fn addr_matches(addr: &[u8; 20], prefix: &[u8], suffixes: &[&[u8]]) -> bool {
     let mut nib = [0u8; 40];
     for i in 0..20 {
         nib[2 * i] = (addr[i] >> 4) & 0xF;
@@ -147,12 +152,25 @@ pub fn addr_matches(addr: &[u8; 20], prefix: &[u8], suffix: &[u8]) -> bool {
             return false;
         }
     }
-    for i in 0..suffix.len() {
-        if nib[40 - suffix.len() + i] != suffix[i] {
-            return false;
+    for s in suffixes {
+        let slen = s.len();
+        if slen == 0 {
+            // An empty suffix group trivially matches; only meaningful if it is
+            // the sole group (handled by caller's prefix-only case).
+            return true;
+        }
+        let mut ok = true;
+        for i in 0..slen {
+            if nib[40 - slen + i] != s[i] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return true;
         }
     }
-    true
+    false
 }
 
 /// Zeroize a private key buffer after use (defense in depth).
@@ -227,9 +245,24 @@ mod tests {
         let addr = [0xABu8; 20];
         let prefix = vec![0xAu8, 0xBu8];
         let suffix = vec![0xAu8, 0xBu8];
-        assert!(addr_matches(&addr, &prefix, &suffix));
+        assert!(addr_matches(&addr, &prefix, &[&suffix]));
         let bad = vec![0x0u8, 0xBu8];
-        assert!(!addr_matches(&addr, &bad, &suffix));
+        assert!(!addr_matches(&addr, &bad, &[&suffix]));
+    }
+
+    #[test]
+    fn addr_matches_multi_suffix_any_group() {
+        let addr = [0xABu8; 20];
+        let prefix = vec![0xAu8, 0xBu8];
+        let s8 = vec![0xAu8, 0xBu8]; // matches
+        let s7 = vec![0x7u8, 0x7u8]; // does not match
+                                     // addr matches group 0 (s8) even though group 1 (s7) does not.
+        assert!(addr_matches(&addr, &prefix, &[&s8, &s7]));
+        // If group 0 is the non-matching one but group 1 matches:
+        let s8_bad = vec![0x0u8, 0x1u8];
+        assert!(addr_matches(&addr, &prefix, &[&s8_bad, &s8]));
+        // Neither matches:
+        assert!(!addr_matches(&addr, &prefix, &[&s8_bad, &s7]));
     }
 
     #[test]

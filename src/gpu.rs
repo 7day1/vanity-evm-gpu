@@ -384,8 +384,16 @@ fn device_name(dev: &ocl::Device) -> String {
         .unwrap_or_else(|_| "<unknown device>".to_string())
 }
 
+/// Number of `u32` slots the params buffer needs for a given pattern.
+/// Layout: 90 base slots + 2 header slots (num_alt, alt_len) + 40 slots per
+/// alternative suffix group. Group 0 lives in the base [50..90) region, so it
+/// does not add to the count.
+fn params_len(pattern: &Pattern) -> usize {
+    92 + pattern.alt_suffixes.len() * 40
+}
+
 fn make_params(base: &[u32; 8], pattern: &Pattern) -> Vec<u32> {
-    let mut p = vec![0u32; 90];
+    let mut p = vec![0u32; params_len(pattern)];
     p[0] = pattern.prefix.len() as u32;
     p[1] = pattern.suffix.len() as u32;
     p[2..10].copy_from_slice(base);
@@ -394,6 +402,15 @@ fn make_params(base: &[u32; 8], pattern: &Pattern) -> Vec<u32> {
     }
     for i in 0..pattern.suffix.len().min(40) {
         p[50 + i] = pattern.suffix[i] as u32;
+    }
+    // Alternative suffix groups (packed, each into 40 slots).
+    p[90] = pattern.alt_suffixes.len() as u32;
+    p[91] = pattern.suffix.len() as u32; // all groups share this length
+    for (g, alt) in pattern.alt_suffixes.iter().enumerate() {
+        let base_off = 92 + g * 40;
+        for i in 0..alt.len().min(40) {
+            p[base_off + i] = alt[i] as u32;
+        }
     }
     p
 }
@@ -452,7 +469,7 @@ pub fn run_gpu(
         .ok()?;
     let params = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
-        .len(90)
+        .len(params_len(pattern))
         .build()
         .ok()?;
 
@@ -660,9 +677,12 @@ pub fn self_test(selection: DeviceSelection) -> bool {
         .len(20)
         .build()
         .unwrap();
+    // self-test only ever uses a single (empty) suffix group; a fixed buffer
+    // of 132 slots is enough for up to one alternative group and keeps the
+    // allocation independent of the per-trial Pattern built below.
     let params = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
-        .len(90)
+        .len(132)
         .build()
         .unwrap();
 
@@ -711,6 +731,7 @@ pub fn self_test(selection: DeviceSelection) -> bool {
         let pat = Pattern {
             prefix: prefix.clone(),
             suffix: vec![],
+            alt_suffixes: vec![],
         };
 
         params.write(&make_params(&base, &pat)).enq().unwrap();
@@ -979,6 +1000,7 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
     let pat = Pattern {
         prefix: impossible.to_vec(),
         suffix: vec![],
+        alt_suffixes: vec![],
     };
 
     let base_buf = Buffer::<u32>::builder()
@@ -1013,7 +1035,7 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
         .ok()?;
     let params = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
-        .len(90)
+        .len(params_len(&pat))
         .build()
         .ok()?;
 

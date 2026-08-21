@@ -706,8 +706,22 @@ __kernel void hash_addrs(__global uint* pubs, __global uchar* addrs) {
     keccak256_addr(Qx, Qy, &addrs[addr_off]);
 }
 
-// params layout: [0]=prefix_len, [1]=suffix_len, [2..9]=base[8],
-//                [10..49]=prefix nibbles(40), [50..89]=suffix nibbles(40)
+// params layout:
+//   [0]      = prefix_len
+//   [1]      = primary suffix_len (group 0)
+//   [2..9]   = base[8]
+//   [10..49] = prefix nibbles (40 slots)
+//   [50..89] = primary suffix nibbles (group 0, 40 slots)
+//   [90]     = num_alt_suffixes (extra groups, 0 = single-suffix legacy mode)
+//   [91]     = alt suffix length (all alt groups share this length; equal to
+//              group 0's length, enforced on the host)
+//   [92..]   = alt suffix nibbles, each group packed into 40 slots:
+//              group g (1-based) occupies [92 + (g-1)*40 .. 92 + (g-1)*40 + 40)
+//
+// Backward compatibility: when num_alt_suffixes == 0 the matching logic below
+// reduces EXACTLY to the original single-suffix comparison (prefix + group 0
+// only), so existing self-tests and the verified Windows/AMD path are
+// unaffected.
 __kernel void match_addrs(__global uint* base,
                           __global uchar* addrs,
                           __global int*  out_found,
@@ -719,6 +733,8 @@ __kernel void match_addrs(__global uint* base,
 
     uint prefix_len = params[0];
     uint suffix_len = params[1];
+    uint num_alt = params[90];
+    uint alt_len = params[91];
 
     uint key[8];
     key_add_gid(key, base, (uint64_t)gid);
@@ -726,18 +742,34 @@ __kernel void match_addrs(__global uint* base,
     uchar addr[20];
     for (int i = 0; i < 20; i++) addr[i] = addrs[addr_off + i];
 
-    int match = 1;
+    // Match prefix first (shared across all groups).
+    int prefix_ok = 1;
     for (uint i = 0; i < prefix_len; i++) {
         uchar n = (i & 1u) ? (addr[i / 2] & 0xF) : ((addr[i / 2] >> 4) & 0xF);
-        if (n != (uchar)(params[10 + i])) { match = 0; break; }
+        if (n != (uchar)(params[10 + i])) { prefix_ok = 0; break; }
     }
-    if (match) {
-        for (uint i = 0; i < suffix_len; i++) {
-            uint idx = 40u - suffix_len + i;
+    if (!prefix_ok) return;
+
+    // Try group 0 (primary suffix).
+    int match = 1;
+    for (uint i = 0; i < suffix_len; i++) {
+        uint idx = 40u - suffix_len + i;
+        uchar n = (idx & 1u) ? (addr[idx / 2] & 0xF) : ((addr[idx / 2] >> 4) & 0xF);
+        if (n != (uchar)(params[50 + i])) { match = 0; break; }
+    }
+
+    // Try alternative suffix groups (any one hitting is enough).
+    for (uint g = 0; g < num_alt && !match; g++) {
+        uint base_off = 92u + g * 40u;
+        int local = 1;
+        for (uint i = 0; i < alt_len; i++) {
+            uint idx = 40u - alt_len + i;
             uchar n = (idx & 1u) ? (addr[idx / 2] & 0xF) : ((addr[idx / 2] >> 4) & 0xF);
-            if (n != (uchar)(params[50 + i])) { match = 0; break; }
+            if (n != (uchar)(params[base_off + i])) { local = 0; break; }
         }
+        if (local) match = 1;
     }
+
     if (match) {
         int idx = atomic_inc(out_found);
         if (idx == 0) {

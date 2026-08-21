@@ -29,6 +29,13 @@ struct Cli {
     #[arg(long, default_value = "")]
     suffix: String,
 
+    /// Additional suffixes to match (comma-separated hex). An address matches
+    /// if its suffix equals `--suffix` OR any one of `--suffixes` (all must be
+    /// the same length). Lets a single search collect several vanity patterns
+    /// at once. Example: `--suffix 88888888 --suffixes 77777777,66666666`.
+    #[arg(long, value_delimiter = ',')]
+    suffixes: Vec<String>,
+
     /// Number of CPU worker threads (CPU mode only).
     #[arg(long)]
     workers: Option<usize>,
@@ -191,11 +198,21 @@ fn main() {
         }
     }
 
-    let pattern = match config::Pattern::parse(&cli.prefix, &cli.suffix) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(2);
+    let pattern = if cli.suffixes.is_empty() {
+        match config::Pattern::parse(&cli.prefix, &cli.suffix) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(2);
+            }
+        }
+    } else {
+        match config::Pattern::parse_multi(&cli.prefix, &cli.suffix, &cli.suffixes) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(2);
+            }
         }
     };
 
@@ -245,10 +262,18 @@ fn main() {
         return;
     }
 
+    let suffix_desc = if pattern.alt_suffixes.is_empty() {
+        cli.suffix.clone()
+    } else {
+        let mut v: Vec<String> = vec![cli.suffix.clone()];
+        v.extend(cli.suffixes.iter().cloned());
+        v.join(",")
+    };
     println!(
-        "target: prefix='{}' suffix='{}'  (expected ~{:.0} attempts)",
+        "target: prefix='{}' suffixes=[{}]  ({} group(s), expected ~{:.0} attempts)",
         cli.prefix,
-        cli.suffix,
+        suffix_desc,
+        pattern.suffix_group_count(),
         pattern.expected_attempts()
     );
     println!("backend: {}", backend.label());
@@ -257,7 +282,13 @@ fn main() {
         Backend::Gpu => {
             let batch = cli.batch.unwrap_or(1 << 12);
             match gpu::run_gpu(&pattern, max_seconds, batch, device, false, None) {
-                Some(m) => finish(m.priv32, m.addr, &result_dir, cli.redact_private_key),
+                Some(m) => finish(
+                    m.priv32,
+                    m.addr,
+                    &result_dir,
+                    cli.redact_private_key,
+                    &pattern,
+                ),
                 None => println!("no match found (stopped)."),
             }
         }
@@ -265,7 +296,13 @@ fn main() {
             let workers = cli.workers.unwrap_or_else(default_workers);
             println!("[cpu] workers={}", workers);
             match cpu_worker::run_cpu(&pattern, max_seconds, workers, None) {
-                Some(m) => finish(m.priv32, m.addr, &result_dir, cli.redact_private_key),
+                Some(m) => finish(
+                    m.priv32,
+                    m.addr,
+                    &result_dir,
+                    cli.redact_private_key,
+                    &pattern,
+                ),
                 None => println!("no match found (stopped)."),
             }
         }
@@ -285,7 +322,13 @@ impl Backend {
     }
 }
 
-fn finish(priv32: [u8; 32], addr: [u8; 20], result_dir: &Path, redact: bool) {
+fn finish(
+    priv32: [u8; 32],
+    addr: [u8; 20],
+    result_dir: &Path,
+    redact: bool,
+    pattern: &config::Pattern,
+) {
     let found = output::Found {
         priv_reduced: priv32,
         raw_addr: addr,
@@ -299,6 +342,25 @@ fn finish(priv32: [u8; 32], addr: [u8; 20], result_dir: &Path, redact: bool) {
     } else {
         println!("Address: 0x{}", address);
         println!("PrivateKey: 0x{}", key_hex.as_str());
+    }
+
+    // Report which of the (possibly several) suffix groups actually matched.
+    if let Some(gi) = pattern.matched_suffix_group(&addr, &pattern.prefix) {
+        if pattern.alt_suffixes.is_empty() {
+            println!(
+                "matched: suffix group {} ('{}')",
+                gi,
+                pattern
+                    .suffix
+                    .iter()
+                    .map(|n| format!("{:x}", n))
+                    .collect::<String>()
+            );
+        } else {
+            let all = pattern.all_suffixes();
+            let hex: String = all[gi].iter().map(|n| format!("{:x}", n)).collect();
+            println!("matched: suffix group {} ('{}')", gi, hex);
+        }
     }
 
     if let Err(e) = output::write_result(result_dir, &found, redact) {

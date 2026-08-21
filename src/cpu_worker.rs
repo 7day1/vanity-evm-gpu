@@ -53,6 +53,7 @@ pub fn run_cpu(
         let pat = Pattern {
             prefix: pattern.prefix.clone(),
             suffix: pattern.suffix.clone(),
+            alt_suffixes: pattern.alt_suffixes.clone(),
         };
         let h = std::thread::spawn(move || {
             let secp = Secp256k1::new();
@@ -86,7 +87,8 @@ pub fn run_cpu(
                 // never counted, slightly under-reporting attempts/rate).
                 let _ = total_attempts.fetch_add(1, Ordering::Relaxed);
                 attempts += 1;
-                if addr_matches(&addr, &pat.prefix, &pat.suffix) {
+                let groups: Vec<&[u8]> = pat.all_suffixes().iter().map(|s| s.as_slice()).collect();
+                if addr_matches(&addr, &pat.prefix, &groups) {
                     if !found.swap(true, Ordering::Relaxed) {
                         *result.lock().unwrap() = Some((buf, addr));
                     }
