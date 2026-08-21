@@ -521,8 +521,8 @@ __kernel void radeon_step_bit(__global uint* pubs, __global uint* base, __global
         carry = s >> 32;
     }
 
-    int limb = bit_index / 32;
-    int bit  = 31 - (bit_index % 32);
+    int limb = bit_index_local / 32;
+    int bit  = 31 - (bit_index_local % 32);
     uint kb = (key[limb] >> bit) & 1u;
 
     uint RX[8], RY[8], RZ[8];
