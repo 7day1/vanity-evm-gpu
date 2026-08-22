@@ -761,13 +761,13 @@ __kernel void match_addrs(__global uint* base,
     // Try alternative suffix groups (any one hitting is enough).
     for (uint g = 0; g < num_alt && !match; g++) {
         uint base_off = 92u + g * 40u;
-        int local = 1;
+        int matched_local = 1;
         for (uint i = 0; i < alt_len; i++) {
             uint idx = 40u - alt_len + i;
             uchar n = (idx & 1u) ? (addr[idx / 2] & 0xF) : ((addr[idx / 2] >> 4) & 0xF);
-            if (n != (uchar)(params[base_off + i])) { local = 0; break; }
+            if (n != (uchar)(params[base_off + i])) { matched_local = 0; break; }
         }
-        if (local) match = 1;
+        if (matched_local) match = 1;
     }
 
     if (match) {
