@@ -6,6 +6,7 @@ pub enum ConfigError {
     InvalidHex(String),
     TooLong(usize),
     TooManySuffixes(usize),
+    DuplicateSuffixes(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -19,6 +20,15 @@ impl std::fmt::Display for ConfigError {
                     f,
                     "too many suffixes ({} > 16) — keep --suffixes under 16 groups",
                     n
+                )
+            }
+            ConfigError::DuplicateSuffixes(s) => {
+                write!(
+                    f,
+                    "duplicate suffix group {:?} — in --all-groups mode a duplicated pattern \
+                     can never complete (its group is indistinguishable from the first), \
+                     causing an infinite search",
+                    s
                 )
             }
         }
@@ -82,6 +92,20 @@ impl Pattern {
         let total_groups = groups.len();
         if total_groups > 16 {
             return Err(ConfigError::TooManySuffixes(total_groups));
+        }
+        // Reject duplicated suffix groups: in --all-groups mode a duplicate can
+        // never be collected as a distinct group (matched_suffix_group always
+        // resolves to the FIRST matching group), so the search would never
+        // complete. Catch it at parse time instead of hanging at runtime.
+        {
+            let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+            for g in &groups {
+                if !seen.insert(g.as_slice()) {
+                    return Err(ConfigError::DuplicateSuffixes(
+                        g.iter().map(|n| format!("{:x}", n)).collect(),
+                    ));
+                }
+            }
         }
         Ok(Self {
             prefix,
@@ -248,5 +272,17 @@ mod tests {
             Pattern::parse_multi("a", "88888888", &many),
             Err(ConfigError::TooManySuffixes(_))
         ));
+    }
+
+    #[test]
+    fn parse_multi_duplicate_rejected() {
+        // A duplicated group makes --all-groups uncompletable: the duplicate
+        // can never be collected as a distinct match, so the search would hang.
+        assert!(matches!(
+            Pattern::parse_multi("", "88888888", &["88888888".to_string()]),
+            Err(ConfigError::DuplicateSuffixes(_))
+        ));
+        // Distinct groups still pass.
+        assert!(Pattern::parse_multi("", "88888888", &["77777777".to_string()]).is_ok());
     }
 }

@@ -89,11 +89,14 @@ fn chrono_stamp() -> String {
     // Append a monotonically increasing sequence number so two results
     // written within the same second (e.g. --all-groups matches found back
     // to back) never collide on the same stamped filename. Without this, the
-    // second write silently overwrote the first result file.
+    // second write silently overwrote the first result file. The sequence is
+    // per-process, so also include the PID: two concurrent generator
+    // processes writing to the same result dir (e.g. one per window) must not
+    // collide either.
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{}", secs, seq)
+    format!("{}-p{}-{}", secs, std::process::id(), seq)
 }
 
 #[cfg(test)]
