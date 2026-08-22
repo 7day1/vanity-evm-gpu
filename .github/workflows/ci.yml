@@ -160,6 +160,10 @@ jobs:
           name: vanity-evm-gpu-windows-x64
           path: dist
 
+      - name: List downloaded artifact (debug)
+        # If publish fails, this reveals whether the zip/exes made it across.
+        run: ls -la dist/ 2>&1 || echo "dist/ is empty"
+
       - name: Publish / update "latest" prerelease
         # Rolling prerelease: every push to main ships fresh prebuilt binaries
         # so Windows 11 users can download and run with zero build steps. The
@@ -170,6 +174,8 @@ jobs:
           tag_name: latest
           name: latest (rolling prebuilt)
           prerelease: true
+          overwrite_files: true
+          fail_on_unmatched_files: false
           body: |
             Automated prebuilt Windows x64 binaries from the latest `main`.
             Built by CI — run `--self-test` on your own machine to validate the
@@ -178,12 +184,7 @@ jobs:
             `vanity-evm-gpu-win64.zip` = portable bundle (CLI + GUI + run.bat
             + README + LICENSE + SHA256SUMS). Verify integrity with
             `Get-Content SHA256SUMS.txt` / `Get-FileHash`.
-          files: |
-            dist/vanity-evm-gpu.exe
-            dist/vanity-evm-gui.exe
-            dist/SHA256SUMS.txt
-            dist/vanity-evm-gpu-win64.zip
-          fail_on_unmatched_files: true
+          files: dist/*
 
   macos-build:
     name: macOS build (no GPU; Apple Silicon + Intel)

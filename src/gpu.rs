@@ -662,12 +662,10 @@ pub fn run_gpu(
         }
 
         let mut found = [0i32; 1];
-        if iter_ok {
-            if out_found.read(&mut found[..]).enq().is_err() {
-                iter_ok = false;
-            } else if proque.queue().finish().is_err() {
-                iter_ok = false;
-            }
+        if iter_ok
+            && (out_found.read(&mut found[..]).enq().is_err() || proque.queue().finish().is_err())
+        {
+            iter_ok = false;
         }
 
         if !iter_ok {
