@@ -126,7 +126,7 @@ cargo build --release
 ./target/release/vanity-evm-gui
 ```
 
-GUI 与 CLI **共用同一套搜索内核与 CPU 验证 oracle**，二者安全性一致。窗口里可填前缀/后缀、最长秒数、GPU 设备选择、强制 CPU、隐藏私钥；**开始/停止** 按钮通过进度回调（`ProgressCb` 返回 `false` 作为取消信号）干净地中断搜索循环。GUI 命中后同样写入 `results/matched-wallet-latest.txt`。
+GUI 与 CLI **共用同一套搜索内核与 CPU 验证 oracle**，二者安全性一致。窗口里可填前缀/后缀/**额外后缀（逗号分隔，等长，等价 `--suffixes`）**、最长秒数、GPU 设备选择、强制 CPU、**每组各出一个（`--all-groups`）**、隐藏私钥；**开始/停止** 按钮通过进度回调（`ProgressCb` 返回 `false` 作为取消信号）干净地中断搜索循环。GUI 命中后同样写入 `results/matched-wallet-latest.txt`。
 
 > 注意：GUI 依赖系统图形栈（macOS 为原生 Cocoa + OpenGL，Windows/Linux 为 winit + OpenGL），在无显示环境（纯 SSH/CI headless）下无法打开窗口，请改用 CLI。
 

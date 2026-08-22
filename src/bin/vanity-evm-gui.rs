@@ -93,6 +93,8 @@ struct VanityApp {
     // --- input fields ---
     prefix: String,
     suffix: String,
+    /// Additional suffix groups, comma-separated (mirrors CLI `--suffixes`).
+    suffixes: String,
     max_seconds: String,
     force_cpu: bool,
     all_groups: bool,
@@ -114,6 +116,7 @@ impl Default for VanityApp {
             state: Arc::new(Mutex::new(GuiState::default())),
             prefix: String::new(),
             suffix: String::new(),
+            suffixes: String::new(),
             max_seconds: String::new(),
             force_cpu: false,
             all_groups: false,
@@ -141,6 +144,11 @@ impl eframe::App for VanityApp {
             ui.horizontal(|ui| {
                 ui.label("后缀 (suffix):");
                 ui.text_edit_singleline(&mut self.suffix);
+                ui.label("额外后缀 (逗号分隔, 等长):");
+                ui.text_edit_singleline(&mut self.suffixes);
+                if !self.suffixes.trim().is_empty() {
+                    ui.small(format!("命中 {} 或任一额外后缀", self.suffix.trim()));
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("最长秒数 (0=不限):");
@@ -366,7 +374,18 @@ impl VanityApp {
 
         // Validate the pattern up front (in the UI thread) so we can show a
         // clear message instead of silently exiting.
-        match config::Pattern::parse(&self.prefix, &self.suffix) {
+        let suffixes_list: Vec<String> = self
+            .suffixes
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let parsed = if suffixes_list.is_empty() {
+            config::Pattern::parse(&self.prefix, &self.suffix)
+        } else {
+            config::Pattern::parse_multi(&self.prefix, &self.suffix, &suffixes_list)
+        };
+        match parsed {
             Ok(_) => {}
             Err(e) => {
                 self.notice = format!("参数错误: {}", e);
@@ -404,7 +423,15 @@ impl VanityApp {
         let state = self.state.clone();
 
         thread::spawn(move || {
-            run_search(&prefix, &suffix, max_seconds, force_cpu, &device_sel, state);
+            run_search(
+                &prefix,
+                &suffix,
+                &suffixes_list,
+                max_seconds,
+                force_cpu,
+                &device_sel,
+                state,
+            );
         });
     }
 
@@ -465,12 +492,18 @@ fn copy_to_clipboard(text: &str) -> bool {
 fn run_search(
     prefix: &str,
     suffix: &str,
+    suffixes_list: &[String],
     max_seconds: Option<u64>,
     force_cpu: bool,
     device_sel: &str,
     state: Arc<Mutex<GuiState>>,
 ) {
-    let pattern = match config::Pattern::parse(prefix, suffix) {
+    let pattern = if suffixes_list.is_empty() {
+        config::Pattern::parse(prefix, suffix)
+    } else {
+        config::Pattern::parse_multi(prefix, suffix, suffixes_list)
+    };
+    let pattern = match pattern {
         Ok(p) => p,
         Err(e) => {
             let mut s = state.lock().unwrap();
