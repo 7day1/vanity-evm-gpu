@@ -95,3 +95,45 @@ fn chrono_stamp() -> String {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{}-{}", secs, seq)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: many results written within the same second must all
+    /// land in distinct files. Before the sequence-number fix, `--all-groups`
+    /// matches found back-to-back collided on `matched-wallet-{secs}.txt` and
+    /// silently overwrote each other (data loss).
+    #[test]
+    fn many_same_second_writes_are_all_kept() {
+        let dir = std::env::temp_dir().join(format!("veg-out-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let found = Found {
+            priv_reduced: [0x42u8; 32],
+            raw_addr: [0x11u8; 20],
+        };
+        const N: usize = 1000;
+        for _ in 0..N {
+            write_result(&dir, &found, false).expect("write_result");
+        }
+        let stamped: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("matched-wallet-") && n != "matched-wallet-latest.txt")
+            .collect();
+        assert_eq!(
+            stamped.len(),
+            N,
+            "expected {} distinct stamped result files, got {}",
+            N,
+            stamped.len()
+        );
+        // All filenames unique (no collision = no silent overwrite).
+        let mut sorted = stamped.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), N, "duplicate stamped filenames detected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

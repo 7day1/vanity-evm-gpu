@@ -575,6 +575,17 @@ pub fn run_gpu(
     let start = std::time::Instant::now();
     let deadline = max_seconds.map(std::time::Duration::from_secs);
     let mut next_report = total + (batch as u64 * 20);
+    // Rate is computed from THIS session's attempts only: when resuming from a
+    // state file, `total` includes previous sessions' work but `elapsed` starts
+    // at zero, so dividing total/elapsed would wildly overstate the rate.
+    let session_start_total = total;
+    // Fail-fast guard: if the OpenCL driver resets mid-run (Windows TDR, device
+    // hang), every enq/finish below starts failing. Without this counter the
+    // loop would spin forever on a dead device, silently wasting days. After
+    // `MAX_CONSECUTIVE_FAILURES` fully-failed iterations we abort with a clear
+    // message instead.
+    const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         if let Some(d) = deadline {
@@ -586,40 +597,100 @@ pub fn run_gpu(
             break;
         }
 
+        // --- one full GPU iteration; any failure marks the iteration bad ---
+        let mut iter_ok = true;
         let p = make_params(&base, pattern);
-        params.write(&p).enq().ok();
-        base_buf.write(&base[..]).enq().ok();
-        let zero = [0i32];
-        out_found.write(&zero[..]).enq().ok();
-        proque.queue().finish().ok();
-
-        unsafe {
-            derive
-                .cmd()
-                .global_work_size(SpatialDims::One(batch))
-                .enq()
-                .ok();
+        if params.write(&p).enq().is_err() {
+            iter_ok = false;
         }
-        proque.queue().finish().ok();
-        unsafe {
-            hash.cmd()
-                .global_work_size(SpatialDims::One(batch))
-                .enq()
-                .ok();
+        if iter_ok && base_buf.write(&base[..]).enq().is_err() {
+            iter_ok = false;
         }
-        proque.queue().finish().ok();
-        unsafe {
-            matcher
-                .cmd()
-                .global_work_size(SpatialDims::One(batch))
-                .enq()
-                .ok();
+        if iter_ok {
+            let zero = [0i32];
+            if out_found.write(&zero[..]).enq().is_err() {
+                iter_ok = false;
+            }
         }
-        proque.queue().finish().ok();
+        if iter_ok && proque.queue().finish().is_err() {
+            iter_ok = false;
+        }
+        if iter_ok {
+            unsafe {
+                if derive
+                    .cmd()
+                    .global_work_size(SpatialDims::One(batch))
+                    .enq()
+                    .is_err()
+                {
+                    iter_ok = false;
+                }
+            }
+        }
+        if iter_ok && proque.queue().finish().is_err() {
+            iter_ok = false;
+        }
+        if iter_ok {
+            unsafe {
+                if hash
+                    .cmd()
+                    .global_work_size(SpatialDims::One(batch))
+                    .enq()
+                    .is_err()
+                {
+                    iter_ok = false;
+                }
+            }
+        }
+        if iter_ok && proque.queue().finish().is_err() {
+            iter_ok = false;
+        }
+        if iter_ok {
+            unsafe {
+                if matcher
+                    .cmd()
+                    .global_work_size(SpatialDims::One(batch))
+                    .enq()
+                    .is_err()
+                {
+                    iter_ok = false;
+                }
+            }
+        }
+        if iter_ok && proque.queue().finish().is_err() {
+            iter_ok = false;
+        }
 
         let mut found = [0i32; 1];
-        out_found.read(&mut found[..]).enq().ok();
-        proque.queue().finish().ok();
+        if iter_ok {
+            if out_found.read(&mut found[..]).enq().is_err() {
+                iter_ok = false;
+            } else if proque.queue().finish().is_err() {
+                iter_ok = false;
+            }
+        }
+
+        if !iter_ok {
+            consecutive_failures += 1;
+            eprintln!(
+                "[gpu][WARN] OpenCL iteration failed ({}/{} consecutive) — device may have \
+                 reset (Windows TDR?). Re-run with the same --resume-state to continue; \
+                 see README 'Windows 稳定性' for TdrDelay advice.",
+                consecutive_failures, MAX_CONSECUTIVE_FAILURES
+            );
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                eprintln!(
+                    "[gpu] aborting after {} consecutive failed iterations — GPU device is \
+                     not responding. Progress saved; re-run the same command to resume.",
+                    consecutive_failures
+                );
+                break;
+            }
+            // Skip the rest of this iteration; do NOT advance `base` so no key
+            // range is skipped when the iteration partially executed.
+            continue;
+        }
+        consecutive_failures = 0;
 
         if found[0] > 0 {
             let mut priv_u32 = [0u32; 8];
@@ -654,7 +725,7 @@ pub fn run_gpu(
                                 backend: "GPU",
                                 device: dev_name.clone(),
                                 attempts: total,
-                                rate: total as f64 / elapsed.max(1e-6),
+                                rate: (total - session_start_total) as f64 / elapsed.max(1e-6),
                                 elapsed_secs: elapsed,
                                 done: true,
                             });
@@ -672,7 +743,7 @@ pub fn run_gpu(
                                 backend: "GPU",
                                 device: dev_name.clone(),
                                 attempts: total,
-                                rate: total as f64 / elapsed.max(1e-6),
+                                rate: (total - session_start_total) as f64 / elapsed.max(1e-6),
                                 elapsed_secs: elapsed,
                                 done: true,
                             });
@@ -706,7 +777,7 @@ pub fn run_gpu(
 
         if total >= next_report {
             let elapsed = start.elapsed().as_secs_f64();
-            let rate = total as f64 / elapsed.max(1e-6);
+            let rate = (total - session_start_total) as f64 / elapsed.max(1e-6);
             eprintln!(
                 "[gpu] device='{}' attempts={} rate={:.2}M/s elapsed={:.0}s groups={}/{}",
                 dev_name,
