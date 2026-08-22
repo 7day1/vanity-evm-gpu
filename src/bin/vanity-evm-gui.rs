@@ -60,6 +60,10 @@ struct GuiState {
     /// if run. The default Jacobian path is always used by `run_gpu`; this
     /// second button only validates the alternative kernel layout.
     radeon_self_test_result: Option<String>,
+    /// When true, keep searching until every suffix group has a match (mirrors
+    /// the CLI `--all-groups` flag). Added to the shared state so the background
+    /// thread can read it without borrowing `self`.
+    all_groups: bool,
 }
 
 impl Default for GuiState {
@@ -77,6 +81,7 @@ impl Default for GuiState {
             stop_requested: false,
             self_test_result: None,
             radeon_self_test_result: None,
+            all_groups: false,
         }
     }
 }
@@ -90,6 +95,7 @@ struct VanityApp {
     suffix: String,
     max_seconds: String,
     force_cpu: bool,
+    all_groups: bool,
     redact: bool,
     /// Which GPU device to request: "auto" / index / name substring.
     device_sel: String,
@@ -110,6 +116,7 @@ impl Default for VanityApp {
             suffix: String::new(),
             max_seconds: String::new(),
             force_cpu: false,
+            all_groups: false,
             redact: false,
             device_sel: "auto".to_string(),
             notice: String::new(),
@@ -166,6 +173,14 @@ impl eframe::App for VanityApp {
                 };
             });
             ui.checkbox(&mut self.force_cpu, "强制 CPU 模式 (跳过 GPU 探测)");
+            // The all_groups toggle needs to reach the background thread, which
+            // only borrows the shared `GuiState`. We mirror it into `GuiState`
+            // on every UI frame so the worker reads the latest value.
+            {
+                let mut s = self.state.lock().unwrap();
+                s.all_groups = self.all_groups;
+            }
+            ui.checkbox(&mut self.all_groups, "每组后缀各出一个 (--all-groups)");
             ui.checkbox(&mut self.redact, "隐藏私钥 (redact)");
 
             ui.separator();
@@ -495,69 +510,69 @@ fn run_search(
     let batch = 1 << 12; // 4096 — safe default for integrated GPUs.
     let device = parse_device(device_sel);
 
+    let all_groups = state.lock().unwrap().all_groups;
     if use_gpu {
-        match gpu::run_gpu(
+        let matches = gpu::run_gpu(
             &pattern,
             max_seconds,
             batch,
             device,
             false,
+            all_groups,
+            None,
             Some(cb.clone()),
-        ) {
-            Some(m) => {
-                let found = Found {
-                    priv_reduced: m.priv32,
-                    raw_addr: m.addr,
-                };
-                // Persist to ./results (mirrors the CLI) before moving `found`
-                // into the shared state, since `Found` is not `Copy`.
-                {
-                    let redact = state.lock().unwrap().redact;
-                    let _ = output::write_result(&PathBuf::from("results"), &found, redact);
-                }
-                let mut s = state.lock().unwrap();
-                s.result = Some(found);
-                s.running = false;
+        );
+        if let Some(m) = matches.into_iter().next() {
+            let found = Found {
+                priv_reduced: m.priv32,
+                raw_addr: m.addr,
+            };
+            // Persist to ./results (mirrors the CLI) before moving `found`
+            // into the shared state, since `Found` is not `Copy`.
+            {
+                let redact = state.lock().unwrap().redact;
+                let _ = output::write_result(&PathBuf::from("results"), &found, redact);
             }
-            None => {
-                let mut s = state.lock().unwrap();
-                if s.stop_requested {
-                    s.error = Some("已被用户停止 (Stop)".to_string());
-                } else {
-                    s.error = Some("未在限定时间内找到匹配 (no match)".to_string());
-                }
-                s.running = false;
+            let mut s = state.lock().unwrap();
+            s.result = Some(found);
+            s.running = false;
+        } else {
+            let mut s = state.lock().unwrap();
+            if s.stop_requested {
+                s.error = Some("已被用户停止 (Stop)".to_string());
+            } else {
+                s.error = Some("未在限定时间内找到匹配 (no match)".to_string());
             }
+            s.running = false;
         }
     } else {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        match cpu_worker::run_cpu(&pattern, max_seconds, workers, Some(cb.clone())) {
-            Some(m) => {
-                let found = Found {
-                    priv_reduced: m.priv32,
-                    raw_addr: m.addr,
-                };
-                // Persist to ./results (mirrors the CLI) before moving `found`
-                // into the shared state, since `Found` is not `Copy`.
-                {
-                    let redact = state.lock().unwrap().redact;
-                    let _ = output::write_result(&PathBuf::from("results"), &found, redact);
-                }
-                let mut s = state.lock().unwrap();
-                s.result = Some(found);
-                s.running = false;
+        let matches =
+            cpu_worker::run_cpu(&pattern, max_seconds, workers, all_groups, Some(cb.clone()));
+        if let Some(m) = matches.into_iter().next() {
+            let found = Found {
+                priv_reduced: m.priv32,
+                raw_addr: m.addr,
+            };
+            // Persist to ./results (mirrors the CLI) before moving `found`
+            // into the shared state, since `Found` is not `Copy`.
+            {
+                let redact = state.lock().unwrap().redact;
+                let _ = output::write_result(&PathBuf::from("results"), &found, redact);
             }
-            None => {
-                let mut s = state.lock().unwrap();
-                if s.stop_requested {
-                    s.error = Some("已被用户停止 (Stop)".to_string());
-                } else {
-                    s.error = Some("未在限定时间内找到匹配 (no match)".to_string());
-                }
-                s.running = false;
+            let mut s = state.lock().unwrap();
+            s.result = Some(found);
+            s.running = false;
+        } else {
+            let mut s = state.lock().unwrap();
+            if s.stop_requested {
+                s.error = Some("已被用户停止 (Stop)".to_string());
+            } else {
+                s.error = Some("未在限定时间内找到匹配 (no match)".to_string());
             }
+            s.running = false;
         }
     }
 }
@@ -640,6 +655,7 @@ mod tests {
             stop_requested: true,
             self_test_result: None,
             radeon_self_test_result: None,
+            all_groups: false,
         };
         // The reset path overwrites the whole struct; the old `result` is
         // dropped (and zeroized by ZeroizeOnDrop) rather than carried over.

@@ -10,6 +10,8 @@ use crate::progress::{Progress, ProgressCb};
 use ocl::{Buffer, Device, DeviceType, Platform, ProQue, SpatialDims};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use std::collections::HashSet;
+use std::path::Path;
 use zeroize::ZeroizeOnDrop;
 
 /// Result of a GPU match. Zeroized on drop (defense-in-depth).
@@ -415,15 +417,60 @@ fn make_params(base: &[u32; 8], pattern: &Pattern) -> Vec<u32> {
     p
 }
 
+/// Resume-state record for the GPU search. The GPU path brute-forces a 256-bit
+/// space by advancing `base` by `batch` each iteration, so persisting the last
+/// `base` lets a restarted run continue from where it stopped instead of
+/// re-scanning already-tested keys. (CPU mode uses random keys and cannot
+/// resume — see README.)
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct ResumeState {
+    base: [u8; 32],
+    total: u64,
+    found_groups: Vec<usize>,
+}
+
+fn load_resume_state(path: &Path) -> Option<ResumeState> {
+    let s = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+fn save_resume_state(path: &Path, st: &ResumeState) {
+    if let Ok(s) = serde_json::to_string(st) {
+        // Best-effort: write atomically so a crash mid-write never corrupts it.
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &s).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// Run the GPU search.
+///
+/// * `all_groups` — when true, keep searching until **every** suffix group in
+///   `pattern` has been matched at least once (one address per group), instead
+///   of stopping at the first match. Useful when you need e.g. both an `88888888`
+///   and a `77777777` address and want them in one run.
+/// * `resume_state` — when `Some(path)`, the last `base` offset (and collected
+///   groups) is read from / written to this file each iteration so an
+///   interrupted long run can continue without re-scanning.
+///
+/// Returns all matched results (1 in default mode, up to `group_count` in
+/// `--all-groups` mode).
+#[allow(clippy::too_many_arguments)]
 pub fn run_gpu(
     pattern: &Pattern,
     max_seconds: Option<u64>,
     batch: usize,
     selection: DeviceSelection,
     dry_run: bool,
+    all_groups: bool,
+    resume_state: Option<&Path>,
     cb: Option<ProgressCb>,
-) -> Option<GpuMatch> {
-    let (proque, dev) = select_device(selection)?;
+) -> Vec<GpuMatch> {
+    let (proque, dev) = match select_device(selection) {
+        Some(x) => x,
+        None => return Vec::new(),
+    };
     let dev_name = device_name(&dev);
     eprintln!("[gpu] using device: {}", dev_name);
     if let Some(cb) = &cb {
@@ -440,51 +487,47 @@ pub fn run_gpu(
     let base_buf = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
         .len(8)
-        .build()
-        .ok()?;
+        .build();
     let pubs = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
         .len(batch * 16)
-        .build()
-        .ok()?;
+        .build();
     let addrs = Buffer::<u8>::builder()
         .queue(proque.queue().clone())
         .len(batch * 20)
-        .build()
-        .ok()?;
+        .build();
     let out_found = Buffer::<i32>::builder()
         .queue(proque.queue().clone())
         .len(1)
-        .build()
-        .ok()?;
+        .build();
     let out_priv = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
         .len(8)
-        .build()
-        .ok()?;
+        .build();
     let out_addr = Buffer::<u8>::builder()
         .queue(proque.queue().clone())
         .len(20)
-        .build()
-        .ok()?;
+        .build();
     let params = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
         .len(params_len(pattern))
-        .build()
-        .ok()?;
+        .build();
+    let (base_buf, pubs, addrs, out_found, out_priv, out_addr, params) =
+        match (base_buf, pubs, addrs, out_found, out_priv, out_addr, params) {
+            (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e), Ok(f), Ok(g)) => (a, b, c, d, e, f, g),
+            _ => return Vec::new(),
+        };
 
     let derive = proque
         .kernel_builder("derive_pubkeys")
         .arg(&base_buf)
         .arg(&pubs)
-        .build()
-        .ok()?;
+        .build();
     let hash = proque
         .kernel_builder("hash_addrs")
         .arg(&pubs)
         .arg(&addrs)
-        .build()
-        .ok()?;
+        .build();
     let matcher = proque
         .kernel_builder("match_addrs")
         .arg(&base_buf)
@@ -493,16 +536,45 @@ pub fn run_gpu(
         .arg(&out_priv)
         .arg(&out_addr)
         .arg(&params)
-        .build()
-        .ok()?;
+        .build();
+    let (derive, hash, matcher) = match (derive, hash, matcher) {
+        (Ok(d), Ok(h), Ok(m)) => (d, h, m),
+        _ => return Vec::new(),
+    };
 
-    let mut base_bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut base_bytes);
-    let mut base = bytes_to_u32x8(&base_bytes);
+    // Seed base: resume from the saved offset if present, else fresh random.
+    let mut base: [u32; 8];
+    let mut total: u64;
+    let mut found_groups: HashSet<usize> = HashSet::new();
+    if let Some(path) = resume_state {
+        if let Some(st) = load_resume_state(path) {
+            base = bytes_to_u32x8(&st.base);
+            total = st.total;
+            found_groups = st.found_groups.iter().cloned().collect();
+            eprintln!(
+                "[gpu] resumed from {} (base offset loaded, {} group(s) already found)",
+                path.display(),
+                found_groups.len()
+            );
+        } else {
+            let mut base_bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut base_bytes);
+            base = bytes_to_u32x8(&base_bytes);
+            total = 0;
+        }
+    } else {
+        let mut base_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut base_bytes);
+        base = bytes_to_u32x8(&base_bytes);
+        total = 0;
+    }
+
+    let total_groups = pattern.suffix_group_count();
+    let mut results: Vec<GpuMatch> = Vec::new();
 
     let start = std::time::Instant::now();
     let deadline = max_seconds.map(std::time::Duration::from_secs);
-    let mut total: u64 = 0;
+    let mut next_report = total + (batch as u64 * 20);
 
     loop {
         if let Some(d) = deadline {
@@ -515,68 +587,101 @@ pub fn run_gpu(
         }
 
         let p = make_params(&base, pattern);
-        params.write(&p).enq().ok()?;
-        base_buf.write(&base[..]).enq().ok()?;
+        params.write(&p).enq().ok();
+        base_buf.write(&base[..]).enq().ok();
         let zero = [0i32];
-        out_found.write(&zero[..]).enq().ok()?;
-        proque.queue().finish().ok()?;
+        out_found.write(&zero[..]).enq().ok();
+        proque.queue().finish().ok();
 
         unsafe {
             derive
                 .cmd()
                 .global_work_size(SpatialDims::One(batch))
                 .enq()
-                .ok()?;
+                .ok();
         }
-        proque.queue().finish().ok()?;
+        proque.queue().finish().ok();
         unsafe {
             hash.cmd()
                 .global_work_size(SpatialDims::One(batch))
                 .enq()
-                .ok()?;
+                .ok();
         }
-        proque.queue().finish().ok()?;
+        proque.queue().finish().ok();
         unsafe {
             matcher
                 .cmd()
                 .global_work_size(SpatialDims::One(batch))
                 .enq()
-                .ok()?;
+                .ok();
         }
-        proque.queue().finish().ok()?;
+        proque.queue().finish().ok();
 
         let mut found = [0i32; 1];
-        out_found.read(&mut found[..]).enq().ok()?;
-        proque.queue().finish().ok()?;
+        out_found.read(&mut found[..]).enq().ok();
+        proque.queue().finish().ok();
 
         if found[0] > 0 {
             let mut priv_u32 = [0u32; 8];
             let mut addr = [0u8; 20];
-            out_priv.read(&mut priv_u32[..]).enq().ok()?;
-            out_addr.read(&mut addr[..]).enq().ok()?;
-            proque.queue().finish().ok()?;
+            out_priv.read(&mut priv_u32[..]).enq().ok();
+            out_addr.read(&mut addr[..]).enq().ok();
+            proque.queue().finish().ok();
 
             let mut key_bytes = u32x8_to_bytes(&priv_u32);
             match privkey_to_address(&key_bytes) {
                 Some(cpu_addr) if cpu_addr == addr => {
                     let reduced = reduce_mod_n(&key_bytes);
-                    let m = GpuMatch {
-                        priv32: reduced,
-                        addr,
-                    };
                     zeroize_key(&mut key_bytes);
-                    if let Some(cb) = &cb {
-                        let elapsed = start.elapsed().as_secs_f64();
-                        cb(&Progress {
-                            backend: "GPU",
-                            device: dev_name.clone(),
-                            attempts: total,
-                            rate: total as f64 / elapsed.max(1e-6),
-                            elapsed_secs: elapsed,
-                            done: true,
+                    // Determine which suffix group this address matched.
+                    let group = pattern.matched_suffix_group(&addr, &pattern.prefix);
+                    let is_new_group = group.map(|g| found_groups.insert(g)).unwrap_or(false);
+                    // Record the result. In default mode every match is kept;
+                    // in --all-groups mode we only keep matches for groups we
+                    // have not collected yet (duplicate-group hits are skipped).
+                    let keep = !all_groups || is_new_group || group.is_none();
+                    if keep {
+                        results.push(GpuMatch {
+                            priv32: reduced,
+                            addr,
                         });
                     }
-                    return Some(m);
+                    if !all_groups {
+                        // First match wins — emit final progress and stop.
+                        if let Some(cb) = &cb {
+                            let elapsed = start.elapsed().as_secs_f64();
+                            cb(&Progress {
+                                backend: "GPU",
+                                device: dev_name.clone(),
+                                attempts: total,
+                                rate: total as f64 / elapsed.max(1e-6),
+                                elapsed_secs: elapsed,
+                                done: true,
+                            });
+                        }
+                        if let Some(path) = resume_state {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        return results;
+                    }
+                    // --all-groups: stop once every group has been collected.
+                    if found_groups.len() >= total_groups {
+                        if let Some(cb) = &cb {
+                            let elapsed = start.elapsed().as_secs_f64();
+                            cb(&Progress {
+                                backend: "GPU",
+                                device: dev_name.clone(),
+                                attempts: total,
+                                rate: total as f64 / elapsed.max(1e-6),
+                                elapsed_secs: elapsed,
+                                done: true,
+                            });
+                        }
+                        if let Some(path) = resume_state {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        return results;
+                    }
                 }
                 _ => {
                     eprintln!(
@@ -588,16 +693,30 @@ pub fn run_gpu(
         }
 
         total += batch as u64;
-        if total.is_multiple_of(batch as u64 * 20) {
+        if let Some(path) = resume_state {
+            // Persist progress for crash-safe resume.
+            let base_bytes = u32x8_to_bytes(&base);
+            let st = ResumeState {
+                base: base_bytes,
+                total,
+                found_groups: found_groups.iter().cloned().collect(),
+            };
+            save_resume_state(path, &st);
+        }
+
+        if total >= next_report {
             let elapsed = start.elapsed().as_secs_f64();
             let rate = total as f64 / elapsed.max(1e-6);
             eprintln!(
-                "[gpu] device='{}' attempts={} rate={:.2}M/s elapsed={:.0}s",
+                "[gpu] device='{}' attempts={} rate={:.2}M/s elapsed={:.0}s groups={}/{}",
                 dev_name,
                 total,
                 rate / 1e6,
-                elapsed
+                elapsed,
+                found_groups.len(),
+                total_groups
             );
+            next_report = total + (batch as u64 * 20);
             if let Some(cb) = &cb {
                 let keep_going = cb(&Progress {
                     backend: "GPU",
@@ -607,9 +726,6 @@ pub fn run_gpu(
                     elapsed_secs: elapsed,
                     done: false,
                 });
-                // A `false` return is the front-end's cancellation request
-                // (e.g. the GUI "Stop" button). Break out of the search loop;
-                // the final `done = true` progress is emitted below.
                 if !keep_going {
                     eprintln!("[gpu] progress callback requested stop — cancelling search");
                     break;
@@ -632,7 +748,7 @@ pub fn run_gpu(
             done: true,
         });
     }
-    None
+    results
 }
 
 /// Validate the GPU kernel against the CPU reference on the selected device.

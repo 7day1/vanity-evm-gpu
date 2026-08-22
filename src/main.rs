@@ -102,6 +102,22 @@ struct Cli {
     #[arg(long)]
     duration: Option<u64>,
 
+    /// Collect one address PER suffix group before stopping (instead of the
+    /// default "stop at the first match"). Requires `--suffixes` (or several
+    /// groups) to be meaningful. Example: `--suffix 88888888 --suffixes 77777777
+    /// --all-groups` yields one 88888888 address AND one 77777777 address in a
+    /// single run.
+    #[arg(long)]
+    all_groups: bool,
+
+    /// GPU crash-safe resume: write the current scan offset to this file every
+    /// iteration and reload it on restart, so an interrupted long run continues
+    /// from where it stopped instead of re-scanning. CPU mode ignores this
+    /// (it uses random keys and cannot resume). Example: `--resume-state
+    /// gpu.state`.
+    #[arg(long)]
+    resume_state: Option<PathBuf>,
+
     /// Prove the GPU kernel/device works on a single dispatch, then exit
     /// without emitting a (false) candidate. No file is written.
     #[arg(long)]
@@ -248,11 +264,11 @@ fn main() {
         match backend {
             Backend::Gpu => {
                 let batch = cli.batch.unwrap_or(1 << 12);
-                match gpu::run_gpu(&pattern, Some(1), batch, device, true, None) {
-                    Some(_) => {
-                        println!("[dry-run] OK — GPU kernel returned a CPU-verified candidate.")
-                    }
-                    None => println!("[dry-run] OK — GPU dispatch completed (no match in sample)."),
+                let m = gpu::run_gpu(&pattern, Some(1), batch, device, true, false, None, None);
+                if m.is_empty() {
+                    println!("[dry-run] OK — GPU dispatch completed (no match in sample).")
+                } else {
+                    println!("[dry-run] OK — GPU kernel returned a CPU-verified candidate.")
                 }
             }
             Backend::Cpu => {
@@ -281,29 +297,34 @@ fn main() {
     match backend {
         Backend::Gpu => {
             let batch = cli.batch.unwrap_or(1 << 12);
-            match gpu::run_gpu(&pattern, max_seconds, batch, device, false, None) {
-                Some(m) => finish(
-                    m.priv32,
-                    m.addr,
-                    &result_dir,
-                    cli.redact_private_key,
-                    &pattern,
-                ),
-                None => println!("no match found (stopped)."),
+            let matches = gpu::run_gpu(
+                &pattern,
+                max_seconds,
+                batch,
+                device,
+                false,
+                cli.all_groups,
+                cli.resume_state.as_deref(),
+                None,
+            );
+            if matches.is_empty() {
+                println!("no match found (stopped).");
+            } else {
+                let pairs: Vec<([u8; 32], [u8; 20])> =
+                    matches.iter().map(|m| (m.priv32, m.addr)).collect();
+                finish_all(&pairs, &result_dir, cli.redact_private_key, &pattern);
             }
         }
         Backend::Cpu => {
             let workers = cli.workers.unwrap_or_else(default_workers);
             println!("[cpu] workers={}", workers);
-            match cpu_worker::run_cpu(&pattern, max_seconds, workers, None) {
-                Some(m) => finish(
-                    m.priv32,
-                    m.addr,
-                    &result_dir,
-                    cli.redact_private_key,
-                    &pattern,
-                ),
-                None => println!("no match found (stopped)."),
+            let matches = cpu_worker::run_cpu(&pattern, max_seconds, workers, cli.all_groups, None);
+            if matches.is_empty() {
+                println!("no match found (stopped).");
+            } else {
+                let pairs: Vec<([u8; 32], [u8; 20])> =
+                    matches.iter().map(|m| (m.priv32, m.addr)).collect();
+                finish_all(&pairs, &result_dir, cli.redact_private_key, &pattern);
             }
         }
     }
@@ -322,59 +343,61 @@ impl Backend {
     }
 }
 
-fn finish(
-    priv32: [u8; 32],
-    addr: [u8; 20],
+fn finish_all(
+    matches: &[([u8; 32], [u8; 20])],
     result_dir: &Path,
     redact: bool,
     pattern: &config::Pattern,
 ) {
-    let found = output::Found {
-        priv_reduced: priv32,
-        raw_addr: addr,
-    };
-    let address = found.address_eip55();
-    let key_hex = found.private_key_hex();
+    println!("=== {} match(es) found ===", matches.len());
+    for (i, (priv32, addr)) in matches.iter().enumerate() {
+        let found = output::Found {
+            priv_reduced: *priv32,
+            raw_addr: *addr,
+        };
+        let address = found.address_eip55();
+        let key_hex = found.private_key_hex();
 
-    if redact {
-        println!("Address: 0x{}", address);
-        println!("PrivateKey: [redacted by --redact-private-key]");
-    } else {
-        println!("Address: 0x{}", address);
-        println!("PrivateKey: 0x{}", key_hex.as_str());
-    }
+        if redact {
+            println!("\n[{}] Address: 0x{}", i, address);
+            println!("[{}] PrivateKey: [redacted by --redact-private-key]", i);
+        } else {
+            println!("\n[{}] Address: 0x{}", i, address);
+            println!("[{}] PrivateKey: 0x{}", i, key_hex.as_str());
+        }
 
-    // Report which of the (possibly several) suffix groups actually matched.
-    if let Some(gi) = pattern.matched_suffix_group(&addr, &pattern.prefix) {
-        if pattern.alt_suffixes.is_empty() {
-            println!(
-                "matched: suffix group {} ('{}')",
-                gi,
+        // Report which of the (possibly several) suffix groups actually matched.
+        if let Some(gi) = pattern.matched_suffix_group(addr, &pattern.prefix) {
+            let label = if pattern.alt_suffixes.is_empty() {
                 pattern
                     .suffix
                     .iter()
                     .map(|n| format!("{:x}", n))
                     .collect::<String>()
-            );
-        } else {
-            let all = pattern.all_suffixes();
-            let hex: String = all[gi].iter().map(|n| format!("{:x}", n)).collect();
-            println!("matched: suffix group {} ('{}')", gi, hex);
+            } else {
+                let all = pattern.all_suffixes();
+                all[gi].iter().map(|n| format!("{:x}", n)).collect()
+            };
+            println!("[{}] matched: suffix group {} ('{}')", i, gi, label);
         }
-    }
 
-    if let Err(e) = output::write_result(result_dir, &found, redact) {
-        eprintln!("warning: failed to write result file: {}", e);
-    } else {
-        println!("saved: {}/matched-wallet-latest.txt", result_dir.display());
-    }
+        if let Err(e) = output::write_result(result_dir, &found, redact) {
+            eprintln!("warning: failed to write result file: {}", e);
+        } else {
+            println!(
+                "[{}] saved: {}/matched-wallet-latest.txt",
+                i,
+                result_dir.display()
+            );
+        }
 
-    println!(
-        "\n[security] Verify before funding: re-derive the address from the private key\n\
-         with ethers/web3.py/alloy and confirm it matches 0x{} (EIP-55).",
-        address
-    );
-    if !redact {
-        println!("[security] Back up the private key offline, then delete the result file.");
+        println!(
+            "[security] Verify 0x{} before funding: re-derive from the private key with\n\
+             ethers/web3.py/alloy and confirm it matches (EIP-55). Back up the key offline.",
+            address
+        );
+    }
+    if redact {
+        println!("\n[security] Private keys were redacted; delete result files after backing up.");
     }
 }

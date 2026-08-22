@@ -58,15 +58,21 @@ echo   3. Benchmark  (10 second, pure-rate, no candidates written)
 echo   4. Dry-run    (one GPU dispatch, exit; safe beginner practice)
 echo   5. GUI        (open the eframe window)
 echo   6. Custom args (advanced)
+echo   7. Search 8x8 + 8x7  (one command: 88888888 OR 77777777)
+echo   8. Each group once   (88888888 AND 77777777, --all-groups)
+echo   9. Search + custom result dir
 echo   0. Quit
 echo ============================================================
-set /p CHOICE=Pick [0-6]:
+set /p CHOICE=Pick [0-9]:
 if "%CHOICE%"=="1" goto list
 if "%CHOICE%"=="2" goto selftest
 if "%CHOICE%"=="3" goto bench
 if "%CHOICE%"=="4" goto dryrun
 if "%CHOICE%"=="5" goto gui
 if "%CHOICE%"=="6" goto custom
+if "%CHOICE%"=="7" goto multi
+if "%CHOICE%"=="8" goto allgroups
+if "%CHOICE%"=="9" goto customdir
 if "%CHOICE%"=="0" goto end
 goto menu
 
@@ -110,6 +116,35 @@ exit /b 0
 :custom
 set /p ARGS=Args (e.g. --prefix cafe --device 0):
 "%EXE_CLI%" %ARGS%
+echo.
+pause
+goto menu
+
+:multi
+REM One command, two patterns: tail 8x8 OR tail 8x7. Stops at the first hit.
+if not exist results mkdir results
+echo [run.bat] --suffix 88888888 --suffixes 77777777 (stops at first match)
+"%EXE_CLI%" --suffix 88888888 --suffixes 77777777 --result-dir results
+echo.
+pause
+goto menu
+
+:allgroups
+REM One run, one address per group: 88888888 AND 77777777 (--all-groups).
+if not exist results mkdir results
+echo [run.bat] --all-groups: collect 88888888 AND 77777777 in a single run
+"%EXE_CLI%" --suffix 88888888 --suffixes 77777777 --all-groups --result-dir results
+echo.
+pause
+goto menu
+
+:customdir
+set /p RDIR=Result directory name (e.g. run_8x8_8x7):
+if "%RDIR%"=="" set "RDIR=results"
+if not exist "%RDIR%" mkdir "%RDIR%"
+echo [run.bat] results will be written to: %RDIR%\
+set /p ARGS=Extra args (e.g. --suffix 88888888 --suffixes 77777777 --all-groups):
+"%EXE_CLI%" %ARGS% --result-dir "%RDIR%"
 echo.
 pause
 goto menu

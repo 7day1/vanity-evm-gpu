@@ -208,6 +208,8 @@ cargo build --release
 | `--self-test` | 校验 GPU 内核后退出 |
 | `--dry-run` | 单发 GPU 验证后退出，不产出候选 |
 | `--benchmark N` | 跑 N 秒速率基准（Mkeys/s），不落盘 |
+| `--all-groups` | 每个后缀组各出一个地址再停（而非首次命中即停）。需配合 `--suffixes` 使用，例如 `--suffix 88888888 --suffixes 77777777 --all-groups` 一次跑出两个地址 |
+| `--resume-state <file>` | GPU 崩溃续跑：每轮把扫描偏移写入该文件，重启时读回从断点继续，不重复已扫区间（CPU 为随机密钥，不支持续跑） |
 
 > 难度参考：`16^(前缀长度 + 后缀长度)` 次尝试。6 位 ≈ 1600 万（CPU 约 10–20 秒），8 位 ≈ 43 亿（CPU ~1 小时，GPU ~分钟），10 位 ≈ 1.1 万亿（GPU 十几分钟~几小时，CPU 数天）。使用 `--suffixes` 一次搜 N 个等长后缀时，命中概率约为单后缀的 N 倍，期望耗时约降为 1/N（注意：GPU/CPU 算力被所有组共享，不会变快，只是「更早撞到其中一个」）。
 
@@ -258,6 +260,32 @@ cargo build --release
    ```bash
    ./target/release/vanity-evm-gpu --prefix cafe --cpu
    ```
+
+## Windows 稳定性：显卡看门狗（TDR）
+
+Windows 显示驱动有一个 **TDR（Timeout Detection and Recovery，超时检测与恢复）** 机制：任何 GPU 任务超过默认 **2 秒** 不返回，驱动就判定「卡死」并**重置显卡**。长时间满载的 vanity 搜索偶尔会触发它，表现为：
+
+- 程序突然报 OpenCL 错误 / `CL_OUT_OF_RESOURCES` / 找不到设备；
+- 屏幕闪一下、显卡驱动「重启」；
+- 搜索进程异常退出，但**私钥不会因此泄露**（结果只在命中时才写盘）。
+
+### 缓解办法（按推荐顺序）
+
+1. **优先用 `--max-seconds` 分段跑**：把长任务拆成多段，每段远小于 2 秒级连续独占。例如 9 位后缀任务每次跑 1 小时：
+   ```powershell
+   vanity-evm-gpu.exe --suffix 88888888 --max-seconds 3600 --result-dir results_8
+   ```
+2. **调大 TDR 超时（治本，需管理员）**：注册表把默认 2 秒提到 10–60 秒，给 GPU 长任务喘息空间。
+   - `Win + R` → `regedit` → 定位
+     `HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`
+   - 新建（或改）`DWORD` 值 **`TdrDelay`** = `10`（十进制，单位秒；激进可设 `60`）。
+   - 若存在 **`TdrDdiDelay`**（UMD 超时）也一并设为 `10`。
+   - **重启生效**。改完若系统不稳定，删掉这两个值即可还原。
+   - 仅影响本机调试体验，不改变任何密码学安全性。
+3. **降低 `--batch`**：batch 越大单次 kernel 占用越长，越易撞 TDR。默认 4,096 已保守；若仍触发，降到 `1024` 重试（吞吐略降但更稳）。
+4. **遇到 hang 别强杀**：加 `--max-seconds 30` 让程序自己退出，避免驱动处于半重置状态。
+
+> 说明：TDR 是 Windows 驱动层行为，**与本项目正确性无关**——命中结果都经 CPU 复核（oracle），驱动重置只会导致「这段白跑」，不会产出错误私钥。
 
 ## 项目结构
 

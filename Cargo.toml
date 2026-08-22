@@ -12,6 +12,8 @@ secp256k1 = { version = "0.28", features = ["rand", "alloc"] }
 sha3 = "0.10"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 ocl = "0.19"
 eframe = "0.27"
 arboard = "3"

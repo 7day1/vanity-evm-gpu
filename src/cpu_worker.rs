@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use zeroize::ZeroizeOnDrop;
 
 /// Result of a CPU match. Zeroized on drop (defense-in-depth).
-#[derive(ZeroizeOnDrop)]
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct Match {
     pub priv32: [u8; 32],
     pub addr: [u8; 20],
@@ -23,10 +23,16 @@ pub fn run_cpu(
     pattern: &Pattern,
     max_seconds: Option<u64>,
     workers: usize,
+    all_groups: bool,
     cb: Option<ProgressCb>,
-) -> Option<Match> {
+) -> Vec<Match> {
     let found = Arc::new(AtomicBool::new(false));
-    let result = Arc::new(Mutex::new(None));
+    // In --all-groups mode we collect one address per suffix group; in default
+    // mode a single hit stops everything.
+    let results: Arc<Mutex<Vec<Match>>> = Arc::new(Mutex::new(Vec::new()));
+    let found_groups: Arc<Mutex<std::collections::HashSet<usize>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let total_groups = pattern.suffix_group_count();
     // Shared aggregate attempt counter so the progress callback can report a
     // consistent total across all worker threads.
     let total_attempts = Arc::new(AtomicU64::new(0));
@@ -47,7 +53,8 @@ pub fn run_cpu(
 
     for _ in 0..workers.max(1) {
         let found = found.clone();
-        let result = result.clone();
+        let results = results.clone();
+        let found_groups = found_groups.clone();
         let total_attempts = total_attempts.clone();
         let cb = cb.clone();
         let pat = Pattern {
@@ -89,10 +96,23 @@ pub fn run_cpu(
                 attempts += 1;
                 let groups: Vec<&[u8]> = pat.all_suffixes().iter().map(|s| s.as_slice()).collect();
                 if addr_matches(&addr, &pat.prefix, &groups) {
-                    if !found.swap(true, Ordering::Relaxed) {
-                        *result.lock().unwrap() = Some((buf, addr));
+                    let group = pat.matched_suffix_group(&addr, &pat.prefix);
+                    let is_new = group
+                        .map(|g| found_groups.lock().unwrap().insert(g))
+                        .unwrap_or(false);
+                    let keep = !all_groups || is_new || group.is_none();
+                    if keep {
+                        let m = Match { priv32: buf, addr };
+                        results.lock().unwrap().push(m);
                     }
-                    break;
+                    if !all_groups {
+                        found.swap(true, Ordering::Relaxed);
+                        break;
+                    }
+                    if found_groups.lock().unwrap().len() >= total_groups {
+                        found.swap(true, Ordering::Relaxed);
+                        break;
+                    }
                 }
                 // Report roughly every 500k attempts for a smoother live rate
                 // across many worker threads (was 2M, which lagged badly when
@@ -101,9 +121,10 @@ pub fn run_cpu(
                     let elapsed = start.elapsed().as_secs_f64();
                     let agg = total_attempts.load(Ordering::Relaxed);
                     let rate = agg as f64 / elapsed.max(1e-6);
+                    let fg = found_groups.lock().unwrap().len();
                     eprintln!(
-                        "[cpu] attempts={} rate={:.0}/s elapsed={:.0}s",
-                        agg, rate, elapsed
+                        "[cpu] attempts={} rate={:.0}/s elapsed={:.0}s groups={}/{}",
+                        agg, rate, elapsed, fg, total_groups
                     );
                     if let Some(cb) = &cb {
                         let keep_going = cb(&Progress {
@@ -131,7 +152,7 @@ pub fn run_cpu(
     for h in handles {
         let _ = h.join();
     }
-    let guard = result.lock().unwrap();
+    let guard = results.lock().unwrap();
     if let Some(cb) = &cb {
         let elapsed = start.elapsed().as_secs_f64();
         let agg = total_attempts.load(Ordering::Relaxed);
@@ -144,8 +165,5 @@ pub fn run_cpu(
             done: true,
         });
     }
-    guard.as_ref().map(|(priv32, addr)| Match {
-        priv32: *priv32,
-        addr: *addr,
-    })
+    guard.clone()
 }
