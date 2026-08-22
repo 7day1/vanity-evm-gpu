@@ -285,4 +285,87 @@ mod tests {
         // Distinct groups still pass.
         assert!(Pattern::parse_multi("", "88888888", &["77777777".to_string()]).is_ok());
     }
+
+    /// Parser fuzz: arbitrary strings must never panic — only return a
+    /// `ConfigError` or a valid `Pattern`. Guards against panics on weird
+    /// Unicode / overlong / mixed-case input.
+    #[test]
+    fn parser_never_panics_on_arbitrary_input() {
+        use crate::crypto::privkey_to_address;
+        let mut rng = rand::rngs::OsRng;
+        use rand::RngCore;
+        let cases: Vec<String> = vec![
+            "".into(),
+            "0x".into(),
+            "0X".into(),
+            "zzzz".into(),
+            "中文".into(),
+            "🦀🦀🦀".into(),
+            "a".repeat(100),
+            "0x".to_string() + &"f".repeat(80),
+            "\u{0}\u{1}\u{2}".into(),
+        ];
+        for c in cases {
+            // Must not panic on parse (any Result is fine).
+            let _ = Pattern::parse(&c, &c);
+            let _ = Pattern::parse_multi("", &c, std::slice::from_ref(&c));
+        }
+        // Random 32-byte keys must derive without panic (deterministic path).
+        for _ in 0..200 {
+            let mut b = [0u8; 32];
+            rng.fill_bytes(&mut b);
+            let _ = privkey_to_address(&b);
+        }
+    }
+
+    /// Property: `addr_matches` (used by the search loop) and
+    /// `matched_suffix_group` (used to REPORT which group hit) must agree on
+    /// which address matches which group. They are two independent nibble
+    /// comparisons; any divergence would make the "matched: suffix group N"
+    /// line lie about the result.
+    #[test]
+    fn addr_matches_agrees_with_matched_suffix_group() {
+        use crate::crypto::addr_matches;
+        let patterns = [
+            Pattern::parse("", "88888888").unwrap(),
+            Pattern::parse_multi("", "88888888", &["77777777".to_string()]).unwrap(),
+            Pattern::parse_multi("ca", "88888888", &["77777777".to_string()]).unwrap(),
+            Pattern::parse("cafe", "").unwrap(),
+        ];
+        let mut rng = rand::rngs::OsRng;
+        use rand::RngCore;
+        for pat in &patterns {
+            let groups: Vec<&[u8]> = pat.all_suffixes().iter().map(|s| s.as_slice()).collect();
+            for _ in 0..500 {
+                let mut addr = [0u8; 20];
+                rng.fill_bytes(&mut addr);
+                let matches = addr_matches(&addr, &pat.prefix, &groups);
+                let reported = pat.matched_suffix_group(&addr, &pat.prefix);
+                assert_eq!(
+                    matches,
+                    reported.is_some(),
+                    "addr_matches and matched_suffix_group disagree for addr {:?}",
+                    addr
+                );
+                if let Some(gi) = reported {
+                    // The reported group must itself match.
+                    let nib = {
+                        let mut n = [0u8; 40];
+                        for i in 0..20 {
+                            n[2 * i] = (addr[i] >> 4) & 0xF;
+                            n[2 * i + 1] = addr[i] & 0xF;
+                        }
+                        n
+                    };
+                    let g = groups[gi];
+                    let slen = g.len();
+                    if slen > 0 {
+                        for j in 0..slen {
+                            assert_eq!(nib[40 - slen + j], g[j]);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
