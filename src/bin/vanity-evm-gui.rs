@@ -632,8 +632,95 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "vanity-evm-gpu",
         native_options,
-        Box::new(|_cc| Box::new(VanityApp::default())),
+        Box::new(|cc| {
+            // Install a CJK-capable font before the first paint so all
+            // Chinese labels (buttons, status lines, match text) render as
+            // glyphs instead of tofu boxes. We try the OS-installed font
+            // first (msyh.ttc on Windows; PingFang/Hiragino on macOS; WQY
+            // microhei on Linux). If none exists we fall back to the egui
+            // default font, which still renders ASCII fine.
+            install_cjk_font(&cc.egui_ctx);
+            Box::new(VanityApp::default())
+        }),
     )
+}
+
+/// Try to load a CJK font from a well-known OS location and install it into
+/// egui's font stack. We register the loaded TTF/TTC against both the
+/// `proportional` and `monospace` font families so all UI text (including the
+/// monospaced address/private-key lines) gets CJK coverage. Returns silently
+/// if no CJK font is found — the default Latin font is then used and Chinese
+/// characters render as empty boxes (a known ugliness, but the app remains
+/// fully functional).
+fn install_cjk_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Candidate paths, in priority order. Each platform has one likely location
+    // for a CJK font; missing files are skipped without error.
+    let candidates: &[&str] = &[
+        // Windows: 微软雅黑 (msyh.ttc) — bundled with every Windows since Vista.
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyh.ttc", // (duplicate guard for clarity)
+        r"C:\Windows\Fonts\msyh.ttf", // some embedded SKUs ship .ttf
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+        // macOS: PingFang on modern macOS.
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/Library/Fonts/Songti.ttc",
+        // Linux: 文泉驿微米黑, Noto CJK, DejaVu fallback.
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ];
+
+    let font_data: Option<(Vec<u8>, &'static str)> =
+        candidates.iter().find_map(|p| match std::fs::read(p) {
+            Ok(bytes) => Some((bytes, *p)),
+            Err(_) => None,
+        });
+
+    if let Some((bytes, path)) = font_data {
+        // Pick a stable family name. On Windows, msyh.ttc is a TrueType
+        // collection containing many faces; egui treats the whole file as one
+        // font and renders any CJK glyphs from the first face that defines
+        // them, which works well enough for our mixed CN/EN labels.
+        let family_name = if path.contains("msyh") {
+            "Microsoft YaHei"
+        } else if path.contains("simhei") {
+            "SimHei"
+        } else if path.contains("simsun") {
+            "SimSun"
+        } else if path.contains("PingFang") {
+            "PingFang"
+        } else if path.contains("STHeiti") {
+            "STHeiti"
+        } else if path.contains("Songti") {
+            "Songti"
+        } else if path.contains("wqy") {
+            "WenQuanYi Micro Hei"
+        } else if path.contains("NotoSansCJK") {
+            "Noto Sans CJK SC"
+        } else {
+            "CJKFallback"
+        };
+
+        fonts
+            .font_data
+            .insert(family_name.to_owned(), egui::FontData::from_owned(bytes));
+
+        // Put our font FIRST in both stacks so it wins any glyph that the
+        // default font doesn't have. The egui defaults still handle ASCII
+        // and Latin-1 cleanly behind it.
+        if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            proportional.insert(0, family_name.to_owned());
+        }
+        if let Some(monospace) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            monospace.insert(0, family_name.to_owned());
+        }
+    }
+
+    ctx.set_fonts(fonts);
 }
 
 #[cfg(test)]

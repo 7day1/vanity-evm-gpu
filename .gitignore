@@ -3,3 +3,7 @@
 results/
 *.tmp
 .DS_Store
+# Local release-asset mirror built on demand for offline-distribution to
+# Win machines that can't reach GitHub. Not source — keep out of the repo.
+dist-win64/
+vanity-evm-gpu-win64-offline.zip
