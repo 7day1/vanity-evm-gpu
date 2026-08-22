@@ -18,6 +18,7 @@ use vanity_evm_gpu::{config, cpu_worker, gpu, output};
 #[derive(Parser)]
 #[command(
     name = "vanity-evm-gpu",
+    version,
     about = "EVM vanity address generator with auto GPU (OpenCL) + CPU verification"
 )]
 struct Cli {

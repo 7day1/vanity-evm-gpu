@@ -98,23 +98,52 @@ jobs:
       - name: Smoke (CPU dry-run on the .exe)
         run: ./target/x86_64-pc-windows-msvc/release/vanity-evm-gpu.exe --prefix cafe --cpu --dry-run
 
+      - name: Package portable zip + SHA256SUMS
+        # Single-file deployment bundle: both exes + run.bat launcher + README +
+        # LICENSE + checksums. Users who cannot reach github.com directly can
+        # grab this one zip via USB / chat / cloud drive and be fully set up.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/vanity-evm-gpu.exe $dist/
+          Copy-Item target/x86_64-pc-windows-msvc/release/vanity-evm-gui.exe $dist/
+          # run.bat at the zip root next to the exes: its relative exe lookup
+          # checks the script's own folder first, so this layout just works
+          # after unzip (double-click run.bat and go).
+          Copy-Item scripts/win/run.bat "$dist/run.bat"
+          Copy-Item README.md $dist/
+          Copy-Item LICENSE $dist/
+          $hashes = Get-ChildItem "$dist/*.exe" | ForEach-Object {
+            (Get-FileHash $_.FullName -Algorithm SHA256).Hash + '  ' + $_.Name
+          }
+          $hashes | Set-Content "$dist/SHA256SUMS.txt"
+          Compress-Archive -Path "$dist/*" -DestinationPath vanity-evm-gpu-win64.zip -Force
+          Get-Item vanity-evm-gpu-win64.zip | Select-Object Name, Length
+          Get-Content "$dist/SHA256SUMS.txt"
+
       - name: Upload .exe binaries as artifact
         uses: actions/upload-artifact@v4
         with:
           name: vanity-evm-gpu-windows-x64
           path: |
-            target/x86_64-pc-windows-msvc/release/vanity-evm-gpu.exe
-            target/x86_64-pc-windows-msvc/release/vanity-evm-gui.exe
+            dist/vanity-evm-gpu.exe
+            dist/vanity-evm-gui.exe
+            dist/SHA256SUMS.txt
+            vanity-evm-gpu-win64.zip
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach .exe to GitHub Release (on tags only)
+      - name: Attach binaries to GitHub Release (on tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/x86_64-pc-windows-msvc/release/vanity-evm-gpu.exe
-            target/x86_64-pc-windows-msvc/release/vanity-evm-gui.exe
+            dist/vanity-evm-gpu.exe
+            dist/vanity-evm-gui.exe
+            dist/SHA256SUMS.txt
+            vanity-evm-gpu-win64.zip
           fail_on_unmatched_files: true
 
   publish-latest:
@@ -145,9 +174,15 @@ jobs:
             Automated prebuilt Windows x64 binaries from the latest `main`.
             Built by CI — run `--self-test` on your own machine to validate the
             GPU kernel before a long search.
+
+            `vanity-evm-gpu-win64.zip` = portable bundle (CLI + GUI + run.bat
+            + README + LICENSE + SHA256SUMS). Verify integrity with
+            `Get-Content SHA256SUMS.txt` / `Get-FileHash`.
           files: |
             dist/vanity-evm-gpu.exe
             dist/vanity-evm-gui.exe
+            dist/SHA256SUMS.txt
+            dist/vanity-evm-gpu-win64.zip
           fail_on_unmatched_files: true
 
   macos-build:

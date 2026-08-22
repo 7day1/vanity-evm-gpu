@@ -86,5 +86,12 @@ fn chrono_stamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!("{}", secs)
+    // Append a monotonically increasing sequence number so two results
+    // written within the same second (e.g. --all-groups matches found back
+    // to back) never collide on the same stamped filename. Without this, the
+    // second write silently overwrote the first result file.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{}", secs, seq)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "vanity-evm-gpu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "EVM vanity address generator with auto-adaptive GPU (OpenCL) acceleration, CPU verification oracle, wallet-unbound, local private keys."
 license = "MIT"
