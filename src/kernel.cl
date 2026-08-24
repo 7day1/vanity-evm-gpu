@@ -314,13 +314,18 @@ static void jdouble(uint* RX, uint* RY, uint* RZ,
         return;
     }
 
-    uint delta[8];   // Z^2
     uint gamma[8];   // Y^2
     uint beta[8];    // X*gamma
     uint alpha[8];   // 3*X^2  (secp256k1 has a=0)
     uint t1[8], t2[8], t3[8];
 
-    fe_sqr(delta, PZ);
+    // NOTE: the standard Jacobian doubling formula with a != 0 needs
+    // delta = Z^2, but secp256k1 has a=0 so alpha = 3*X^2 directly and
+    // Z^2 is never used. The old `fe_sqr(delta, PZ)` was dead work —
+    // one full field multiply (64 mul + 40-pass reduce) per doubling,
+    // i.e. ~256 wasted multiplies per scalar_mul. Removing it is a pure
+    // win with no semantic change (self-test still validates equality).
+
     fe_sqr(gamma, PY);
     fe_mul(beta, PX, gamma);
 
@@ -637,8 +642,10 @@ static void keccak_f(uint64_t* st) {
             st[j] = rotl64(tmp, (uint64_t)ROTC[i]);
             tmp = t;
         }
+        // chi step: tc hoisted out of the j-loop so the compiler allocates it
+        // once instead of (potentially) per-iteration.
+        uint64_t tc[5];
         for (int j = 0; j < 5; j++) {
-            uint64_t tc[5];
             for (int i = 0; i < 5; i++) tc[i] = st[j*5 + i];
             for (int i = 0; i < 5; i++)
                 st[j*5 + i] = tc[i] ^ ((~tc[(i+1)%5]) & tc[(i+2)%5]);
