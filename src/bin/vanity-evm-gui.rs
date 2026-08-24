@@ -10,7 +10,6 @@
 //! communicates with the UI exclusively through the shared `ProgressCb` plus a
 //! small `Arc<Mutex<GuiState>>`. The Stop button sets `stop_requested`, which
 //! makes the callback return `false` and cleanly cancels the search loop.
-
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -96,6 +95,10 @@ struct VanityApp {
     /// Additional suffix groups, comma-separated (mirrors CLI `--suffixes`).
     suffixes: String,
     max_seconds: String,
+    /// GPU batch size (work-items per dispatch). 0 = use a built-in default
+    /// tuned for the detected backend. Higher = more GPU throughput on
+    /// discrete GPUs; smaller = more responsive on integrated GPUs.
+    batch: String,
     force_cpu: bool,
     all_groups: bool,
     redact: bool,
@@ -118,6 +121,11 @@ impl Default for VanityApp {
             suffix: String::new(),
             suffixes: String::new(),
             max_seconds: String::new(),
+            // Empty string means "use built-in default" — the worker thread
+            // resolves it to 65,536 for GPU and 4,096 for CPU. The default is
+            // tuned for discrete GPUs; the user can override by typing a
+            // number into the input field.
+            batch: String::new(),
             force_cpu: false,
             all_groups: false,
             redact: false,
@@ -153,6 +161,11 @@ impl eframe::App for VanityApp {
             ui.horizontal(|ui| {
                 ui.label("最长秒数 (0=不限):");
                 ui.text_edit_singleline(&mut self.max_seconds);
+            });
+            ui.horizontal(|ui| {
+                ui.label("每批 key 数 (留空=自动):");
+                ui.text_edit_singleline(&mut self.batch);
+                ui.small("dGPU 推荐 65K-1M / iGPU 用 16K 以下");
             });
             ui.horizontal(|ui| {
                 ui.label("GPU 设备:");
@@ -372,18 +385,49 @@ impl VanityApp {
     fn start_search(&mut self) {
         self.notice.clear();
 
-        // Validate the pattern up front (in the UI thread) so we can show a
-        // clear message instead of silently exiting.
-        let suffixes_list: Vec<String> = self
+        // Auto-split the primary `suffix` field on commas when the user
+        // forgot to type the groups into the dedicated `suffixes` field.
+        // UX trap to avoid: typing `88888888,77777777` into the first suffix
+        // box used to fail hex validation, since the comma was passed to
+        // the parser as part of the suffix. Splitting here keeps the common
+        // "I want multiple suffixes" case working regardless of which box
+        // the user filled.
+        let (primary_suffix, mut alt_suffixes): (String, Vec<String>) =
+            if self.suffix.contains(',') && self.suffixes.trim().is_empty() {
+                let mut parts: Vec<String> = self
+                    .suffix
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parts.is_empty() {
+                    (String::new(), Vec::new())
+                } else {
+                    let primary = parts.remove(0);
+                    self.notice = format!(
+                        "自动识别主后缀里的多个组：'{}' + {} 个额外组（已自动转入额外后缀字段）",
+                        primary,
+                        parts.len()
+                    );
+                    (primary, parts)
+                }
+            } else {
+                (self.suffix.trim().to_string(), Vec::new())
+            };
+
+        // Append any explicit `suffixes` field input on top.
+        let mut alt_from_dedicated: Vec<String> = self
             .suffixes
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        let parsed = if suffixes_list.is_empty() {
-            config::Pattern::parse(&self.prefix, &self.suffix)
+        alt_suffixes.append(&mut alt_from_dedicated);
+
+        let parsed = if alt_suffixes.is_empty() {
+            config::Pattern::parse(&self.prefix, &primary_suffix)
         } else {
-            config::Pattern::parse_multi(&self.prefix, &self.suffix, &suffixes_list)
+            config::Pattern::parse_multi(&self.prefix, &primary_suffix, &alt_suffixes)
         };
         match parsed {
             Ok(_) => {}
@@ -405,6 +449,21 @@ impl VanityApp {
             },
         };
 
+        // Batch size: empty / unparseable → use built-in default that is
+        // tuned for discrete GPUs (65536). iGPU users can override down to
+        // 4096 if `CL_OUT_OF_RESOURCES` is reported.
+        let resolved_batch: usize = match self.batch.trim() {
+            "" => 1 << 16, // 65536 — sweet spot for dGPU, also fine for iGPU
+            s => match s.parse::<usize>() {
+                Ok(0) => 1 << 16,
+                Ok(n) => n,
+                Err(_) => {
+                    self.notice = "每批 key 数必须是正整数（留空=自动）".to_string();
+                    return;
+                }
+            },
+        };
+
         // Reset the shared state and mark running.
         {
             let mut s = self.state.lock().unwrap();
@@ -417,7 +476,7 @@ impl VanityApp {
 
         // Clone inputs for the worker thread.
         let prefix = self.prefix.trim().to_string();
-        let suffix = self.suffix.trim().to_string();
+        // `primary_suffix` was already moved out of `self` above.
         let force_cpu = self.force_cpu;
         let device_sel = self.device_sel.trim().to_string();
         let state = self.state.clone();
@@ -425,11 +484,12 @@ impl VanityApp {
         thread::spawn(move || {
             run_search(
                 &prefix,
-                &suffix,
-                &suffixes_list,
+                &primary_suffix,
+                &alt_suffixes,
                 max_seconds,
                 force_cpu,
                 &device_sel,
+                resolved_batch,
                 state,
             );
         });
@@ -489,6 +549,7 @@ fn copy_to_clipboard(text: &str) -> bool {
 /// Background-thread entry point. Owns the search loop and pushes progress into
 /// `state` via a `ProgressCb`. On completion it records the result (or error)
 /// and flips `running` to false.
+#[allow(clippy::too_many_arguments)]
 fn run_search(
     prefix: &str,
     suffix: &str,
@@ -496,6 +557,7 @@ fn run_search(
     max_seconds: Option<u64>,
     force_cpu: bool,
     device_sel: &str,
+    batch: usize,
     state: Arc<Mutex<GuiState>>,
 ) {
     let pattern = if suffixes_list.is_empty() {
@@ -540,7 +602,13 @@ fn run_search(
         })
     };
 
-    let batch = 1 << 12; // 4096 — safe default for integrated GPUs.
+    let batch = if force_cpu {
+        // CPU work doesn't benefit from large batches — keep it small so the
+        // progress callback fires frequently and Stop stays responsive.
+        1 << 12
+    } else {
+        batch.max(1)
+    };
     let device = parse_device(device_sel);
 
     let all_groups = state.lock().unwrap().all_groups;
