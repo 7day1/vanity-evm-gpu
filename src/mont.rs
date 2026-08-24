@@ -45,6 +45,10 @@ pub const MPRIME: u32 = 0xd225_3531;
 /// `R^2 mod p = 2^512 mod p`, little-endian. `to_mont(a) = mont_mul(a, R2)`.
 pub const R2: [u32; 8] = [0x0e9_0a1, 0x7a2, 0x1, 0, 0, 0, 0, 0];
 
+/// `R mod p = 2^256 mod p = 2^32 + 977`, little-endian. This is the Montgomery
+/// representation of the field element 1 (the multiplicative identity).
+pub const R: [u32; 8] = [0x3d1, 0x1, 0, 0, 0, 0, 0, 0];
+
 /// A field element as 8 little-endian 32-bit limbs.
 pub type Fe = [u32; 8];
 
@@ -61,35 +65,51 @@ fn ge(a: &Fe, b: &Fe) -> bool {
     true // equal
 }
 
-/// `a - b` where both are < p and `a >= b` (borrow never wraps).
-fn sub_noborrow(a: &Fe, b: &Fe) -> Fe {
-    let mut r = [0u32; 8];
-    let mut borrow = 0i64;
-    for i in 0..8 {
-        let cur = a[i] as i64 - b[i] as i64 - borrow;
-        if cur < 0 {
-            r[i] = (cur + (1i64 << 32)) as u32;
-            borrow = 1;
-        } else {
-            r[i] = cur as u32;
-            borrow = 0;
-        }
-    }
-    debug_assert_eq!(borrow, 0, "sub_noborrow called with a < b");
-    r
-}
-
 /// Modular addition `(a + b) mod p`. Works in or out of Montgomery form.
+///
+/// The sum may exceed 2^256 (a+b < 2p < 2^257), so we keep a 9th limb for the
+/// carry and subtract `p` once. The subtraction borrow (when the carry is set,
+/// the low 8 limbs are < p) is absorbed by the 9th limb.
 pub fn mont_add(a: &Fe, b: &Fe) -> Fe {
-    let mut r = [0u32; 8];
+    let mut t = [0u64; 9];
     let mut carry = 0u64;
     for i in 0..8 {
         let v = a[i] as u64 + b[i] as u64 + carry;
-        r[i] = (v & 0xffff_ffff) as u32;
+        t[i] = v & 0xffff_ffff;
         carry = v >> 32;
     }
-    if carry > 0 || ge(&r, &P) {
-        r = sub_noborrow(&r, &P);
+    t[8] = carry;
+
+    let low: Fe = [
+        t[0] as u32,
+        t[1] as u32,
+        t[2] as u32,
+        t[3] as u32,
+        t[4] as u32,
+        t[5] as u32,
+        t[6] as u32,
+        t[7] as u32,
+    ];
+    if t[8] > 0 || ge(&low, &P) {
+        let mut borrow = 0i64;
+        for i in 0..8 {
+            let cur = t[i] as i64 - P[i] as i64 - borrow;
+            if cur < 0 {
+                t[i] = (cur + (1i64 << 32)) as u64;
+                borrow = 1;
+            } else {
+                t[i] = cur as u64;
+                borrow = 0;
+            }
+        }
+        // The borrow (0 or 1) is absorbed by t[8] (which is 1 when set).
+        debug_assert!(t[8] as i64 - borrow >= 0, "mont_add: borrow exceeds carry");
+        t[8] = (t[8] as i64 - borrow) as u64;
+    }
+
+    let mut r: Fe = [0; 8];
+    for i in 0..8 {
+        r[i] = t[i] as u32;
     }
     r
 }
@@ -208,27 +228,10 @@ pub fn from_mont(a: &Fe) -> Fe {
     mont_mul(a, &one)
 }
 
-/// Reduce a canonical value mod p (assumes input < 2p; used after add).
-fn reduce_once(a: &Fe) -> Fe {
-    if ge(a, &P) {
-        sub_noborrow(a, &P)
-    } else {
-        *a
-    }
-}
-
-/// Doubling in Montgomery form (== mont_add(a, a)).
+/// Doubling in Montgomery form (== mont_add(a, a)). Reuses `mont_add` so the
+/// 2^256 carry is handled correctly (the left-shift here can overflow).
 pub fn mont_double(a: &Fe) -> Fe {
-    reduce_once(&{
-        let mut r = [0u32; 8];
-        let mut carry = 0u64;
-        for i in 0..8 {
-            let v = (a[i] as u64) << 1 | carry;
-            r[i] = (v & 0xffff_ffff) as u32;
-            carry = v >> 32;
-        }
-        r
-    })
+    mont_add(a, a)
 }
 
 #[cfg(test)]
@@ -260,12 +263,11 @@ mod tests {
     }
 
     fn rand_fe() -> Fe {
-        // Simple deterministic-ish RNG-free sample using OsRng bytes.
+        // Sample a full 256-bit value, then reduce mod p. Values near p are
+        // what stress the add/sub carry and borrow paths (a+b can exceed 2^256).
         use rand::RngCore;
         let mut b = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut b);
-        // Force < p by clearing the top two bits of the most-significant limb.
-        b[31] &= 0x3f;
         let mut r = [0u32; 8];
         for (i, slot) in r.iter_mut().enumerate() {
             *slot = u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);

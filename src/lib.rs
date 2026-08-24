@@ -12,6 +12,7 @@ pub const KERNEL_SRC: &str = include_str!("kernel.cl");
 pub mod config;
 pub mod cpu_worker;
 pub mod crypto;
+pub mod ec;
 pub mod gpu;
 pub mod mont;
 pub mod output;
