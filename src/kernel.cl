@@ -30,21 +30,28 @@ constant uint R2_MONT[8] = { 0xE90A1u, 0x7A2u, 0x1u, 0, 0, 0, 0, 0 }; // R^2 = 2
 
 // ---- field helpers --------------------------------------------------------
 
-static inline int fe_ge(const uint* a, const uint* b) {
+// All input pointer parameters use __generic so the helpers can be called
+// with both __private (stack/local arrays) and __constant (P, R2_MONT, …)
+// pointers. AMD's comgr strictly enforces pointer address space in static
+// helpers — without __generic a call like `fe_ge(r, P)` fails with
+// "changed address space of pointer". OpenCL 2.0+ is required; the kernel
+// is rejected on devices that only speak 1.2 by the same probe that already
+// skips Mac integrated GPUs.
+static inline int fe_ge(const __generic uint* a, const __generic uint* b) {
     for (int i = 7; i >= 0; i--) {
         if (a[i] > b[i]) return 1;
         if (a[i] < b[i]) return 0;
     }
     return 1; // equal
 }
-static inline int fe_is_zero(const uint* a) {
+static inline int fe_is_zero(const __generic uint* a) {
     for (int i = 0; i < 8; i++) if (a[i]) return 0;
     return 1;
 }
 
 // Montgomery multiply (CIOS): r = a * b * R^-1 mod p.
 // Verbatim port of src/mont.rs::mont_mul (10-limb accumulator).
-static void mont_mul(uint* r, const uint* a, const uint* b) {
+static void mont_mul(uint* r, const __generic uint* a, const __generic uint* b) {
     uint64_t t[10];
     for (int i = 0; i < 10; i++) t[i] = 0;
 
@@ -87,10 +94,10 @@ static void mont_mul(uint* r, const uint* a, const uint* b) {
     }
 }
 
-static void mont_sqr(uint* r, const uint* a) { mont_mul(r, a, a); }
+static void mont_sqr(uint* r, const __generic uint* a) { mont_mul(r, a, a); }
 
 // Montgomery addition (a + b) mod p, with a 9th carry limb.
-static void mont_add(uint* r, const uint* a, const uint* b) {
+static void mont_add(uint* r, const __generic uint* a, const __generic uint* b) {
     uint64_t t[9];
     uint64_t carry = 0;
     for (int i = 0; i < 8; i++) {
@@ -111,7 +118,7 @@ static void mont_add(uint* r, const uint* a, const uint* b) {
 }
 
 // Montgomery subtraction (a - b) mod p.
-static void mont_sub(uint* r, const uint* a, const uint* b) {
+static void mont_sub(uint* r, const __generic uint* a, const __generic uint* b) {
     int64_t borrow = 0;
     for (int i = 0; i < 8; i++) {
         int64_t cur = (int64_t)a[i] - (int64_t)b[i] - borrow;
@@ -129,19 +136,19 @@ static void mont_sub(uint* r, const uint* a, const uint* b) {
 }
 
 // Montgomery doubling (== mont_add(a, a)).
-static void mont_double(uint* r, const uint* a) { mont_add(r, a, a); }
+static void mont_double(uint* r, const __generic uint* a) { mont_add(r, a, a); }
 
 // Convert canonical -> Montgomery form (multiply by R^2).
-static void to_mont(uint* r, const uint* a) { mont_mul(r, a, R2_MONT); }
+static void to_mont(uint* r, const __generic uint* a) { mont_mul(r, a, R2_MONT); }
 
 // Convert Montgomery -> canonical form (multiply by 1).
-static void from_mont(uint* r, const uint* a) {
+static void from_mont(uint* r, const __generic uint* a) {
     uint one[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
     mont_mul(r, a, one);
 }
 
 // Modular inverse via Fermat: a^-1 = a^(p-2), MSB-first square-and-multiply.
-static void fe_inv(uint* r, const uint* a) {
+static void fe_inv(uint* r, const __generic uint* a) {
     uint e[8] = { 0xFFFFFC2Du, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu,
                   0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
     uint res[8];
@@ -165,7 +172,7 @@ static void fe_inv(uint* r, const uint* a) {
 
 // Jacobian doubling R = 2*P (secp256k1 a=0).
 static void j_double(uint* RX, uint* RY, uint* RZ,
-                     const uint* PX, const uint* PY, const uint* PZ) {
+                     const __generic uint* PX, const __generic uint* PY, const __generic uint* PZ) {
     if (fe_is_zero(PZ) || fe_is_zero(PY)) {
         for (int i = 0; i < 8; i++) { RX[i] = 0; RY[i] = 0; RZ[i] = 0; }
         return;
@@ -200,8 +207,8 @@ static void j_double(uint* RX, uint* RY, uint* RZ,
 
 // Mixed Jacobian + affine addition R = P(Jacobian) + Q(affine), no inversion.
 static void j_add_mixed(uint* RX, uint* RY, uint* RZ,
-                        const uint* PX, const uint* PY, const uint* PZ,
-                        const uint* qx, const uint* qy) {
+                        const __generic uint* PX, const __generic uint* PY, const __generic uint* PZ,
+                        const __generic uint* qx, const __generic uint* qy) {
     if (fe_is_zero(PZ)) {
         for (int i = 0; i < 8; i++) { RX[i] = qx[i]; RY[i] = qy[i]; RZ[i] = R_MONT[i]; }
         return;
@@ -251,7 +258,7 @@ static void j_add_mixed(uint* RX, uint* RY, uint* RZ,
 
 // Convert Jacobian to affine (Montgomery form): x = X/Z^2, y = Y/Z^3.
 static void j_to_affine(uint* Qx, uint* Qy,
-                        const uint* X, const uint* Y, const uint* Z) {
+                        const __generic uint* X, const __generic uint* Y, const __generic uint* Z) {
     if (fe_is_zero(Z)) {
         for (int i = 0; i < 8; i++) { Qx[i] = 0; Qy[i] = 0; }
         return;
