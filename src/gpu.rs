@@ -132,6 +132,10 @@ fn build_proque(platform: Platform, device: ocl::Device) -> Option<ProQue> {
     // ("cvms_element_build_from_source"). The runtime probe automatically skips
     // any device that does not build or that produces wrong results, so we
     // simply use the default compiler flags for all devices.
+    //
+    // (ocl 0.19.7 does not expose clBuildProgram compiler options through
+    // ProQueBuilder; kernel-level optimizations live in kernel.cl instead —
+    // see the restrict qualifiers and the non-volatile keccak loop.)
     ProQue::builder()
         .platform(platform)
         .device(device)

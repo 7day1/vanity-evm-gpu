@@ -616,8 +616,13 @@ static void keccak_f(uint64_t* st) {
     const int PILN[24] = {
         10,7,11,17,18,3,5,16,8,21,24,4,15,23,19,13,12,2,20,14,22,9,6,1
     };
-    volatile int rounds = 24;
-    for (int round = 0; round < rounds; round++) {
+    // `rounds` is intentionally NOT volatile: a volatile induction variable
+    // forces the compiler to reload it from memory every iteration and blocks
+    // loop unrolling / pipelining, which measurably slows keccak on AMD
+    // (comgr backend). The Apple 1.2 workaround that once needed `volatile`
+    // here is long gone — the loop body is fully constant-indexed and
+    // compiles correctly on every vendor.
+    for (int round = 0; round < 24; round++) {
         uint64_t bc[5];
         for (int i = 0; i < 5; i++)
             bc[i] = st[i] ^ st[i+5] ^ st[i+10] ^ st[i+15] ^ st[i+20];
@@ -677,7 +682,7 @@ static void key_add_gid(uint* key, __global uint* base, uint64_t gid) {
     }
 }
 
-__kernel void derive_pubkeys(__global uint* base, __global uint* pubs) {
+__kernel void derive_pubkeys(__global uint* restrict base, __global uint* restrict pubs) {
     size_t gid = get_global_id(0);
     size_t off = gid * 16;
 
@@ -693,7 +698,7 @@ __kernel void derive_pubkeys(__global uint* base, __global uint* pubs) {
     }
 }
 
-__kernel void hash_addrs(__global uint* pubs, __global uchar* addrs) {
+__kernel void hash_addrs(__global uint* restrict pubs, __global uchar* restrict addrs) {
     size_t gid = get_global_id(0);
     size_t off = gid * 16;
     size_t addr_off = gid * 20;
@@ -722,12 +727,12 @@ __kernel void hash_addrs(__global uint* pubs, __global uchar* addrs) {
 // reduces EXACTLY to the original single-suffix comparison (prefix + group 0
 // only), so existing self-tests and the verified Windows/AMD path are
 // unaffected.
-__kernel void match_addrs(__global uint* base,
-                          __global uchar* addrs,
-                          __global int*  out_found,
-                          __global uint* out_priv,
-                          __global uchar* out_addr,
-                          __global uint* params) {
+__kernel void match_addrs(__global uint* restrict base,
+                          __global uchar* restrict addrs,
+                          __global int*  restrict out_found,
+                          __global uint* restrict out_priv,
+                          __global uchar* restrict out_addr,
+                          __global uint* restrict params) {
     size_t gid = get_global_id(0);
     size_t addr_off = gid * 20;
 
