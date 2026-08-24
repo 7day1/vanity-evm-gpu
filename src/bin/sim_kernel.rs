@@ -38,11 +38,19 @@ fn print_key(label: &str, k: &[u8; 32]) {
     eprintln!(
         "{}: privkey={}",
         label,
-        k.iter().rev().map(|b| format!("{:02x}", b)).collect::<String>()
+        k.iter()
+            .rev()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
     );
     eprintln!("  X = 0x{}", fe_to_hex(&p.x));
     eprintln!("  Y = 0x{}", fe_to_hex(&p.y));
-    eprintln!("  addr = 0x{}", addr.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+    eprintln!(
+        "  addr = 0x{}",
+        addr.iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    );
 }
 
 fn main() {
@@ -70,7 +78,9 @@ fn main() {
             );
             eprintln!(
                 "  addr        = 0x{}",
-                addr.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                addr.iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
             );
             let precomp = generate_precomp();
             let p = point_mul(&k, &precomp);
@@ -79,17 +89,14 @@ fn main() {
             full[1..33].copy_from_slice(&fe_bytes_be(&p.x));
             full[33..65].copy_from_slice(&fe_bytes_be(&p.y));
             let got_addr = vanity_evm_gpu::crypto::pubkey_to_address(&full);
-            eprintln!(
-                "  point_mul x = 0x{}",
-                fe_to_hex(&p.x)
-            );
-            eprintln!(
-                "  point_mul y = 0x{}",
-                fe_to_hex(&p.y)
-            );
+            eprintln!("  point_mul x = 0x{}", fe_to_hex(&p.x));
+            eprintln!("  point_mul y = 0x{}", fe_to_hex(&p.y));
             eprintln!(
                 "  point_mul addr = 0x{}",
-                got_addr.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                got_addr
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
             );
         }
     }

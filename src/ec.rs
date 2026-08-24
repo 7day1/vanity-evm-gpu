@@ -449,8 +449,18 @@ mod tests {
             let ser = pk.serialize_uncompressed();
             let want_x = bytes_to_fe(&ser[1..33]);
             let want_y = bytes_to_fe(&ser[33..65]);
-            assert_eq!(t[0][b as usize - 1].x, to_mont(&want_x), "col0 byte {} x", b);
-            assert_eq!(t[0][b as usize - 1].y, to_mont(&want_y), "col0 byte {} y", b);
+            assert_eq!(
+                t[0][b as usize - 1].x,
+                to_mont(&want_x),
+                "col0 byte {} x",
+                b
+            );
+            assert_eq!(
+                t[0][b as usize - 1].y,
+                to_mont(&want_y),
+                "col0 byte {} y",
+                b
+            );
         }
     }
 
@@ -461,18 +471,22 @@ mod tests {
         // reduction: byte value 2 at column 31 = scalar 2).
         let t = generate_precomp();
         let g = g_affine_mont();
-        let two = point_mul(&{
-            let mut b = [0u8; 32];
-            b[31] = 2;
-            b
-        }, &t);
+        let two = point_mul(
+            &{
+                let mut b = [0u8; 32];
+                b[31] = 2;
+                b
+            },
+            &t,
+        );
         // Canonical 2G.x/y from secp256k1:
         let secp = secp256k1::Secp256k1::new();
         let sk = secp256k1::SecretKey::from_slice(&{
             let mut b = [0u8; 32];
             b[31] = 2;
             b
-        }).unwrap();
+        })
+        .unwrap();
         let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
         let ser = pk.serialize_uncompressed();
         let want_x = bytes_to_fe(&ser[1..33]);
