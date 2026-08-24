@@ -243,6 +243,23 @@ fn probe_one_vector(
         full[33 + 4 * i..33 + 4 * i + 4].copy_from_slice(&pts[8 + i].to_be_bytes());
     }
     let got = crate::crypto::pubkey_to_address(&full);
+    if got != *expected {
+        // Verbose mismatch dump: print the GPU-computed pubkey bytes and the
+        // addresses, so we can see whether the diff is in x, y, or just a
+        // wrong keccak input.
+        let mut xs = String::new();
+        for b in &full[1..33] { xs.push_str(&format!("{:02x}", b)); }
+        let mut ys = String::new();
+        for b in &full[33..65] { ys.push_str(&format!("{:02x}", b)); }
+        let mut gpu_addr_hex = String::new();
+        for b in &got { gpu_addr_hex.push_str(&format!("{:02x}", b)); }
+        let mut cpu_addr_hex = String::new();
+        for b in expected { cpu_addr_hex.push_str(&format!("{:02x}", b)); }
+        eprintln!(
+            "[probe] base={:08x?}\n  gpu pubkey X = 0x{}\n  gpu pubkey Y = 0x{}\n  gpu addr     = 0x{}\n  cpu addr     = 0x{}",
+            base_u32, xs, ys, gpu_addr_hex, cpu_addr_hex,
+        );
+    }
     got == *expected
 }
 

@@ -408,4 +408,78 @@ mod tests {
         let g = g_affine_mont();
         assert_eq!(t[31][0], g);
     }
+
+    #[test]
+    fn precomp_matches_secp_for_simple_columns() {
+        use secp256k1::{PublicKey, Secp256k1, SecretKey};
+        // Validate the precomputation table against secp256k1 for the cases
+        // that the GPU self-test exercises: column 31 byte values 1, 2, 3.
+        let secp = Secp256k1::new();
+        let t = generate_precomp();
+
+        for &b in &[1u8, 2, 3, 5, 17, 255] {
+            // column 31: byte b at BE position 31 => scalar = b (1G .. 255G)
+            let mut kbytes = [0u8; 32];
+            kbytes[31] = b;
+            let sk = SecretKey::from_slice(&kbytes).unwrap();
+            let pk = PublicKey::from_secret_key(&secp, &sk);
+            let ser = pk.serialize_uncompressed();
+            let want_x = bytes_to_fe(&ser[1..33]);
+            let want_y = bytes_to_fe(&ser[33..65]);
+            assert_eq!(
+                t[31][b as usize - 1].x,
+                to_mont(&want_x),
+                "col31 entry {} x mismatch",
+                b
+            );
+            assert_eq!(
+                t[31][b as usize - 1].y,
+                to_mont(&want_y),
+                "col31 entry {} y mismatch",
+                b
+            );
+        }
+
+        // column 0: byte b at BE position 0 => scalar = b * 256^31
+        for &b in &[1u8, 2, 3] {
+            let mut kbytes = [0u8; 32];
+            kbytes[0] = b;
+            let sk = SecretKey::from_slice(&kbytes).unwrap();
+            let pk = PublicKey::from_secret_key(&secp, &sk);
+            let ser = pk.serialize_uncompressed();
+            let want_x = bytes_to_fe(&ser[1..33]);
+            let want_y = bytes_to_fe(&ser[33..65]);
+            assert_eq!(t[0][b as usize - 1].x, to_mont(&want_x), "col0 byte {} x", b);
+            assert_eq!(t[0][b as usize - 1].y, to_mont(&want_y), "col0 byte {} y", b);
+        }
+    }
+
+    #[test]
+    fn point_mul_doubles_correctly() {
+        // point_mul(2) should equal 2G; point_mul(3) should equal 3G (= G + 2G).
+        // This is the path the GPU probe vector 1 exercises (after byte
+        // reduction: byte value 2 at column 31 = scalar 2).
+        let t = generate_precomp();
+        let g = g_affine_mont();
+        let two = point_mul(&{
+            let mut b = [0u8; 32];
+            b[31] = 2;
+            b
+        }, &t);
+        // Canonical 2G.x/y from secp256k1:
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&{
+            let mut b = [0u8; 32];
+            b[31] = 2;
+            b
+        }).unwrap();
+        let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let ser = pk.serialize_uncompressed();
+        let want_x = bytes_to_fe(&ser[1..33]);
+        let want_y = bytes_to_fe(&ser[33..65]);
+        assert_eq!(two.x, want_x, "2G x mismatch");
+        assert_eq!(two.y, want_y, "2G y mismatch");
+        // also sanity: table[31][1] should equal 2G (i.e. affine(Mont) of want_x/want_y)
+        let _ = g; // silence unused
+    }
 }
