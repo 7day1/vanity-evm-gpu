@@ -59,10 +59,6 @@ struct GuiState {
     /// if run. The default Jacobian path is always used by `run_gpu`; this
     /// second button only validates the alternative kernel layout.
     radeon_self_test_result: Option<String>,
-    /// When true, keep searching until every suffix group has a match (mirrors
-    /// the CLI `--all-groups` flag). Added to the shared state so the background
-    /// thread can read it without borrowing `self`.
-    all_groups: bool,
 }
 
 impl Default for GuiState {
@@ -80,7 +76,6 @@ impl Default for GuiState {
             stop_requested: false,
             self_test_result: None,
             radeon_self_test_result: None,
-            all_groups: false,
         }
     }
 }
@@ -91,16 +86,19 @@ struct VanityApp {
     state: Arc<Mutex<GuiState>>,
     // --- input fields ---
     prefix: String,
-    suffix: String,
-    /// Additional suffix groups, comma-separated (mirrors CLI `--suffixes`).
-    suffixes: String,
+    /// Four independent suffix inputs, each with its own enable checkbox.
+    /// Only checked, non-empty suffixes participate in the search; a match on
+    /// ANY one of them stops the search (first-hit wins, like the CLI without
+    /// `--all-groups`).
+    suffix: [String; 4],
+    /// Per-suffix enable checkboxes (box i gates `suffix[i]`).
+    suffix_enabled: [bool; 4],
     max_seconds: String,
     /// GPU batch size (work-items per dispatch). 0 = use a built-in default
     /// tuned for the detected backend. Higher = more GPU throughput on
     /// discrete GPUs; smaller = more responsive on integrated GPUs.
     batch: String,
     force_cpu: bool,
-    all_groups: bool,
     redact: bool,
     /// Which GPU device to request: "auto" / index / name substring.
     device_sel: String,
@@ -118,8 +116,10 @@ impl Default for VanityApp {
         Self {
             state: Arc::new(Mutex::new(GuiState::default())),
             prefix: String::new(),
-            suffix: String::new(),
-            suffixes: String::new(),
+            suffix: [String::new(), String::new(), String::new(), String::new()],
+            // The first suffix is pre-checked so a single suffix "just works"
+            // like before; the other three are opt-in.
+            suffix_enabled: [true, false, false, false],
             max_seconds: String::new(),
             // Empty string means "use built-in default" — the worker thread
             // resolves it to 65,536 for GPU and 4,096 for CPU. The default is
@@ -127,7 +127,6 @@ impl Default for VanityApp {
             // number into the input field.
             batch: String::new(),
             force_cpu: false,
-            all_groups: false,
             redact: false,
             device_sel: "auto".to_string(),
             notice: String::new(),
@@ -149,15 +148,14 @@ impl eframe::App for VanityApp {
                 ui.label("前缀 (prefix):");
                 ui.text_edit_singleline(&mut self.prefix);
             });
-            ui.horizontal(|ui| {
-                ui.label("后缀 (suffix):");
-                ui.text_edit_singleline(&mut self.suffix);
-                ui.label("额外后缀 (逗号分隔, 等长):");
-                ui.text_edit_singleline(&mut self.suffixes);
-                if !self.suffixes.trim().is_empty() {
-                    ui.small(format!("命中 {} 或任一额外后缀", self.suffix.trim()));
-                }
-            });
+            ui.label("后缀 (勾选即参与匹配，命中任意一个即停止):");
+            for i in 0..4 {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.suffix_enabled[i], format!("后缀 {}:", i + 1));
+                    ui.text_edit_singleline(&mut self.suffix[i]);
+                });
+            }
+            ui.small("所有勾选的后缀需等长（如 88888888 / 77777777）");
             ui.horizontal(|ui| {
                 ui.label("最长秒数 (0=不限):");
                 ui.text_edit_singleline(&mut self.max_seconds);
@@ -194,14 +192,6 @@ impl eframe::App for VanityApp {
                 };
             });
             ui.checkbox(&mut self.force_cpu, "强制 CPU 模式 (跳过 GPU 探测)");
-            // The all_groups toggle needs to reach the background thread, which
-            // only borrows the shared `GuiState`. We mirror it into `GuiState`
-            // on every UI frame so the worker reads the latest value.
-            {
-                let mut s = self.state.lock().unwrap();
-                s.all_groups = self.all_groups;
-            }
-            ui.checkbox(&mut self.all_groups, "每组后缀各出一个 (--all-groups)");
             ui.checkbox(&mut self.redact, "隐藏私钥 (redact)");
 
             ui.separator();
@@ -385,49 +375,24 @@ impl VanityApp {
     fn start_search(&mut self) {
         self.notice.clear();
 
-        // Auto-split the primary `suffix` field on commas when the user
-        // forgot to type the groups into the dedicated `suffixes` field.
-        // UX trap to avoid: typing `88888888,77777777` into the first suffix
-        // box used to fail hex validation, since the comma was passed to
-        // the parser as part of the suffix. Splitting here keeps the common
-        // "I want multiple suffixes" case working regardless of which box
-        // the user filled.
-        let (primary_suffix, mut alt_suffixes): (String, Vec<String>) =
-            if self.suffix.contains(',') && self.suffixes.trim().is_empty() {
-                let mut parts: Vec<String> = self
-                    .suffix
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if parts.is_empty() {
-                    (String::new(), Vec::new())
-                } else {
-                    let primary = parts.remove(0);
-                    self.notice = format!(
-                        "自动识别主后缀里的多个组：'{}' + {} 个额外组（已自动转入额外后缀字段）",
-                        primary,
-                        parts.len()
-                    );
-                    (primary, parts)
-                }
-            } else {
-                (self.suffix.trim().to_string(), Vec::new())
-            };
-
-        // Append any explicit `suffixes` field input on top.
-        let mut alt_from_dedicated: Vec<String> = self
-            .suffixes
-            .split(',')
-            .map(|s| s.trim().to_string())
+        // Collect the checked, non-empty suffix boxes into an ordered group
+        // list. The first becomes the primary suffix (group 0) and the rest
+        // are alternative groups. A match on ANY of them stops the search —
+        // this mirrors the CLI's default (non `--all-groups`) behavior, which
+        // is exactly what "勾选多个 = 命中任意一个即停" means.
+        let groups: Vec<String> = (0..4)
+            .filter(|&i| self.suffix_enabled[i])
+            .map(|i| self.suffix[i].trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        alt_suffixes.append(&mut alt_from_dedicated);
+
+        let primary_suffix = groups.first().cloned().unwrap_or_default();
+        let alt_suffixes: &[String] = if groups.len() > 1 { &groups[1..] } else { &[] };
 
         let parsed = if alt_suffixes.is_empty() {
             config::Pattern::parse(&self.prefix, &primary_suffix)
         } else {
-            config::Pattern::parse_multi(&self.prefix, &primary_suffix, &alt_suffixes)
+            config::Pattern::parse_multi(&self.prefix, &primary_suffix, alt_suffixes)
         };
         match parsed {
             Ok(_) => {}
@@ -474,18 +439,21 @@ impl VanityApp {
             };
         }
 
-        // Clone inputs for the worker thread.
+        // Clone inputs for the worker thread. `groups` (the checked suffix
+        // list) is moved into the closure so the thread owns it; the primary
+        // and alternative groups are sliced from it inside the thread.
         let prefix = self.prefix.trim().to_string();
-        // `primary_suffix` was already moved out of `self` above.
         let force_cpu = self.force_cpu;
         let device_sel = self.device_sel.trim().to_string();
         let state = self.state.clone();
 
         thread::spawn(move || {
+            let primary = groups.first().map(|s| s.as_str()).unwrap_or("");
+            let alts: &[String] = if groups.len() > 1 { &groups[1..] } else { &[] };
             run_search(
                 &prefix,
-                &primary_suffix,
-                &alt_suffixes,
+                primary,
+                alts,
                 max_seconds,
                 force_cpu,
                 &device_sel,
@@ -611,7 +579,9 @@ fn run_search(
     };
     let device = parse_device(device_sel);
 
-    let all_groups = state.lock().unwrap().all_groups;
+    // The GUI is "first-hit wins": a match on any checked suffix stops the
+    // search. There is no --all-groups toggle in the GUI anymore.
+    let all_groups = false;
     if use_gpu {
         let matches = gpu::run_gpu(
             &pattern,
@@ -694,7 +664,7 @@ fn main() -> eframe::Result<()> {
         // eframe 0.27: window size moved into the `viewport` builder.
         // A wider window keeps the Chinese two-column status labels from
         // feeling cramped, and gives the match result room to breathe.
-        viewport: egui::ViewportBuilder::default().with_inner_size([560.0, 640.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([560.0, 740.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -843,7 +813,6 @@ mod tests {
             stop_requested: true,
             self_test_result: None,
             radeon_self_test_result: None,
-            all_groups: false,
         };
         // The reset path overwrites the whole struct; the old `result` is
         // dropped (and zeroized by ZeroizeOnDrop) rather than carried over.
