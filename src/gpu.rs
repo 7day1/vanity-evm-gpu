@@ -21,22 +21,80 @@ const PRECOMP_VALUES: usize = 255;
 /// Total u32 limbs in the precomputed table.
 const PRECOMP_LIMBS: usize = PRECOMP_COLUMNS * PRECOMP_VALUES * PRECOMP_POINT_LIMBS;
 
-/// Convert 32 bytes to 8 little-endian u32 limbs (limb 0 = least significant).
+/// Convert 32 big-endian bytes to 8 little-endian u32 limbs (limb 0 = LSB).
+///
+/// `bytes` is treated as a 256-bit integer in big-endian byte order (bytes[0]
+/// is the most-significant byte, bytes[31] is the least-significant byte). The
+/// returned array has limb 0 as the least-significant u32 and limb 7 as the
+/// most-significant u32, so the kernel's `key_byte(key, i)` (which reads
+/// `key[7 - i/4]` high-byte-first) extracts `bytes[i]` directly.
+///
+/// **Important**: do not name this `_be` and do not change `u32::from_le_bytes`
+/// here to `from_be_bytes`. The kernel's `key_byte` interprets limb 7 as the
+/// MSB limb and reads its bytes in MSB-first order; this layout makes limb 0
+/// hold bytes[28..32] and limb 7 hold bytes[0..4], which is what the kernel
+/// expects.
 fn bytes_to_u32x8_le(b: &[u8; 32]) -> [u32; 8] {
     let mut out = [0u32; 8];
+    // limb i (LSB-first) corresponds to bytes[28 - 4*i .. 32 - 4*i]
     for (i, slot) in out.iter_mut().enumerate() {
-        *slot = u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+        let s = 28 - 4 * i;
+        // The 4 source bytes are in big-endian order; pack as a native u32.
+        // On LE hosts this is equivalent to u32::from_be_bytes, but written
+        // explicitly so the layout is obvious to readers.
+        *slot = ((b[s] as u32) << 24)
+            | ((b[s + 1] as u32) << 16)
+            | ((b[s + 2] as u32) << 8)
+            | (b[s + 3] as u32);
     }
     out
 }
 
-/// Convert 8 little-endian u32 limbs back to 32 bytes.
+/// Convert 8 little-endian u32 limbs back to 32 big-endian bytes.
+/// Inverse of `bytes_to_u32x8_le`: limb i corresponds to bytes[28-4*i .. 32-4*i].
 fn u32x8_le_to_bytes(limbs: &[u32; 8]) -> [u8; 32] {
     let mut b = [0u8; 32];
     for (i, w) in limbs.iter().enumerate() {
-        b[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        let s = 28 - 4 * i;
+        b[s] = (w >> 24) as u8;
+        b[s + 1] = (w >> 16) as u8;
+        b[s + 2] = (w >> 8) as u8;
+        b[s + 3] = *w as u8;
     }
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the byte-order bug that caused `probe vector 1
+    /// (key=2)` to compute `(2 * 256^31) * G` instead of `2 * G`. Before the
+    /// fix, `bytes_to_u32x8_le` packed `bytes[28..32]` into limb 0 (LSB limb),
+    /// but the kernel's `key_byte` reads `key[7 - i/4]` (MSB-first), so the
+    /// byte ended up at limb 7's MSB — pointing the kernel at column 0 entry
+    /// `(b * 256^31) * G` instead of column 31 entry `(b * 256^0) * G`.
+    #[test]
+    fn bytes_to_u32x8_le_layout_is_kernel_consistent() {
+        // bytes[31] = 2 (BE LSB). After encoding, limb 0 must hold the value
+        // so that the kernel reads byte 2 at column 31 (not column 0).
+        let mut bytes = [0u8; 32];
+        bytes[31] = 2;
+        let limbs = bytes_to_u32x8_le(&bytes);
+        // limb 0 = 2 (LSB of the 256-bit integer 2)
+        assert_eq!(limbs[0], 2, "limb 0 must hold the LSB of the scalar");
+        assert_eq!(limbs[7], 0, "limb 7 (MSB) must be zero for scalar 2");
+        // round-trip
+        assert_eq!(u32x8_le_to_bytes(&limbs), bytes);
+
+        // bytes[0] = 2 (BE MSB) -> scalar = 2 * 256^31, limb 7 high byte = 2.
+        let mut bytes2 = [0u8; 32];
+        bytes2[0] = 2;
+        let limbs2 = bytes_to_u32x8_le(&bytes2);
+        assert_eq!(limbs2[0], 0);
+        assert_eq!(limbs2[7], 2 << 24);
+        assert_eq!(u32x8_le_to_bytes(&limbs2), bytes2);
+    }
 }
 
 /// Add a u64 offset to a little-endian 8-limb key (advance the search base).

@@ -54,6 +54,15 @@ fn print_key(label: &str, k: &[u8; 32]) {
 }
 
 fn main() {
+    // Edge case: host's `bytes_to_u32x8_le([0,..,0,2])` returns limbs
+    // [0,..,0, 0x02000000] (limb 7 high byte = 2). The kernel's
+    // `key_byte(key, i)` for i in 0..3 reads key[7]'s high bytes — so the
+    // GPU ends up addressing column 0 entry 1 = (1 * 256^31) * G, NOT 1G.
+    // Print both interpretations so we can see which one matches GPU output.
+    let mut k_msb = [0u8; 32];
+    k_msb[0] = 2;
+    print_key("scalar = 2 * 256^31 (k_msb[0]=2)", &k_msb);
+
     let mut k1 = [0u8; 32];
     k1[31] = 1;
     print_key("key=1", &k1);
