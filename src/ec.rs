@@ -1,9 +1,9 @@
 //! Elliptic-curve point arithmetic over secp256k1, in Montgomery field form.
 //!
-//! This is the mathematical core of the kernel rewrite. The GPU path will do
-//! byte-windowed scalar multiplication with a precomputed table of
-//! `(b * 256^pos) * G` affine points, accumulating in Jacobian coordinates
-//! (no per-add inversion), then convert to affine with a single inversion —
+//! This is the mathematical core of the kernel rewrite. The GPU path does
+//! nibble-windowed (4-bit) scalar multiplication with a precomputed table of
+//! `(b * 16^pos) * G` affine points, accumulating in Jacobian coordinates
+//! (no per-add inversion), then converts to affine with a single inversion —
 //! the exact recipe mature tools (profanity) use to reach ~100+ Mkeys/s.
 //!
 //! Everything here runs on the CPU in Montgomery form (see `crate::mont`) so
@@ -232,17 +232,19 @@ pub fn j_to_affine(p: &Jacobian) -> Affine {
     }
 }
 
-/// Byte-windowed scalar multiplication `R = k * G` using a precomputed table.
+/// Nibble-windowed (4-bit) scalar multiplication `R = k * G` using a
+/// precomputed table.
 ///
-/// `precomp[i][b-1]` holds `(b * 256^(31-i)) * G` in affine Montgomery form
-/// (i is the big-endian byte index of `k`). Result is the affine public key in
-/// **canonical** (non-Montgomery) form.
+/// `precomp[i][b-1]` holds `(b * 16^(63-i)) * G` in affine Montgomery form
+/// (i is the big-endian nibble index of `k`, 0 = most significant). Result is
+/// the affine public key in **canonical** (non-Montgomery) form.
 pub fn point_mul(k: &[u8; 32], precomp: &[Vec<Affine>]) -> Affine {
     let mut r = Jacobian::INF;
-    for i in 0..32 {
-        let byte = k[i] as usize;
-        if byte != 0 {
-            let q = precomp[i][byte - 1];
+    for i in 0..64 {
+        let byte = k[i / 2];
+        let nibble = if i % 2 == 0 { byte >> 4 } else { byte & 0x0f } as usize;
+        if nibble != 0 {
+            let q = precomp[i][nibble - 1];
             r = j_add_mixed(&r, &q);
         }
     }
@@ -301,10 +303,10 @@ fn big_to_bytes(k: &num_bigint::BigUint) -> [u8; 32] {
     out
 }
 
-/// Generate the byte-windowed precomputation table.
+/// Generate the nibble-windowed (4-bit) precomputation table.
 ///
-/// `table[i][b-1]` holds `(b * 256^(31-i)) * G` in affine Montgomery form, for
-/// big-endian byte index `i` and byte value `b ∈ 1..=255`. This is what the
+/// `table[i][b-1]` holds `(b * 16^(63-i)) * G` in affine Montgomery form, for
+/// big-endian nibble index `i` and nibble value `b ∈ 1..=15`. This is what the
 /// host builds (once, at runtime) and uploads to the GPU.
 pub fn generate_precomp() -> Vec<Vec<Affine>> {
     use num_bigint::BigUint;
@@ -312,14 +314,14 @@ pub fn generate_precomp() -> Vec<Vec<Affine>> {
 
     let secp = Secp256k1::new();
     let n = BigUint::from_bytes_be(&N_BYTES);
-    let mut table = Vec::with_capacity(32);
-    for i in 0..32 {
-        let factor = BigUint::from(256u32).pow((31 - i) as u32);
-        let mut col = Vec::with_capacity(255);
-        for b in 1u32..=255 {
+    let mut table = Vec::with_capacity(64);
+    for i in 0..64 {
+        let factor = BigUint::from(16u32).pow((63 - i) as u32);
+        let mut col = Vec::with_capacity(15);
+        for b in 1u32..=15 {
             let k = (BigUint::from(b) * &factor) % &n;
             let kbytes = big_to_bytes(&k);
-            let sk = SecretKey::from_slice(&kbytes).expect("b*256^pos mod n is never zero");
+            let sk = SecretKey::from_slice(&kbytes).expect("b*16^pos mod n is never zero");
             let pk = PublicKey::from_secret_key(&secp, &sk);
             let ser = pk.serialize_uncompressed();
             col.push(Affine {
@@ -400,66 +402,66 @@ mod tests {
     #[test]
     fn precomp_has_expected_shape() {
         let t = generate_precomp();
-        assert_eq!(t.len(), 32);
+        assert_eq!(t.len(), 64);
         for col in &t {
-            assert_eq!(col.len(), 255);
+            assert_eq!(col.len(), 15);
         }
-        // table[31][0] == G (byte 1 at position 31 => 1 * 256^0 * G == G)
+        // table[63][0] == G (nibble 1 at position 63 => 1 * 16^0 * G == G)
         let g = g_affine_mont();
-        assert_eq!(t[31][0], g);
+        assert_eq!(t[63][0], g);
     }
 
     #[test]
     fn precomp_matches_secp_for_simple_columns() {
         use secp256k1::{PublicKey, Secp256k1, SecretKey};
         // Validate the precomputation table against secp256k1 for the cases
-        // that the GPU self-test exercises: column 31 byte values 1, 2, 3.
+        // that the GPU self-test exercises: column 63 nibble values 1, 2, 3.
         let secp = Secp256k1::new();
         let t = generate_precomp();
 
-        for &b in &[1u8, 2, 3, 5, 17, 255] {
-            // column 31: byte b at BE position 31 => scalar = b (1G .. 255G)
+        for &nibble in &[1u8, 2, 3, 5, 9, 15] {
+            // column 63: low nibble of k[31] => scalar = nibble (1G .. 15G)
             let mut kbytes = [0u8; 32];
-            kbytes[31] = b;
+            kbytes[31] = nibble;
             let sk = SecretKey::from_slice(&kbytes).unwrap();
             let pk = PublicKey::from_secret_key(&secp, &sk);
             let ser = pk.serialize_uncompressed();
             let want_x = bytes_to_fe(&ser[1..33]);
             let want_y = bytes_to_fe(&ser[33..65]);
             assert_eq!(
-                t[31][b as usize - 1].x,
+                t[63][nibble as usize - 1].x,
                 to_mont(&want_x),
-                "col31 entry {} x mismatch",
-                b
+                "col63 entry {} x mismatch",
+                nibble
             );
             assert_eq!(
-                t[31][b as usize - 1].y,
+                t[63][nibble as usize - 1].y,
                 to_mont(&want_y),
-                "col31 entry {} y mismatch",
-                b
+                "col63 entry {} y mismatch",
+                nibble
             );
         }
 
-        // column 0: byte b at BE position 0 => scalar = b * 256^31
-        for &b in &[1u8, 2, 3] {
+        // column 0: high nibble of k[0] => scalar = nibble * 16^63
+        for &nibble in &[1u8, 2, 3] {
             let mut kbytes = [0u8; 32];
-            kbytes[0] = b;
+            kbytes[0] = nibble << 4;
             let sk = SecretKey::from_slice(&kbytes).unwrap();
             let pk = PublicKey::from_secret_key(&secp, &sk);
             let ser = pk.serialize_uncompressed();
             let want_x = bytes_to_fe(&ser[1..33]);
             let want_y = bytes_to_fe(&ser[33..65]);
             assert_eq!(
-                t[0][b as usize - 1].x,
+                t[0][nibble as usize - 1].x,
                 to_mont(&want_x),
-                "col0 byte {} x",
-                b
+                "col0 nibble {} x",
+                nibble
             );
             assert_eq!(
-                t[0][b as usize - 1].y,
+                t[0][nibble as usize - 1].y,
                 to_mont(&want_y),
-                "col0 byte {} y",
-                b
+                "col0 nibble {} y",
+                nibble
             );
         }
     }

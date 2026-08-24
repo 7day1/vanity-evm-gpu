@@ -14,12 +14,16 @@ use zeroize::ZeroizeOnDrop;
 
 /// Number of u32 limbs in a precomputed table point (x[8] + y[8]).
 const PRECOMP_POINT_LIMBS: usize = 16;
-/// Number of columns (byte positions) in the byte-windowed table.
-const PRECOMP_COLUMNS: usize = 32;
-/// Number of non-zero byte values per column.
-const PRECOMP_VALUES: usize = 255;
+/// Number of columns (nibble positions) in the nibble-windowed table.
+const PRECOMP_COLUMNS: usize = 64;
+/// Number of non-zero nibble values per column.
+const PRECOMP_VALUES: usize = 15;
 /// Total u32 limbs in the precomputed table.
 const PRECOMP_LIMBS: usize = PRECOMP_COLUMNS * PRECOMP_VALUES * PRECOMP_POINT_LIMBS;
+/// Limbs per point in Jacobian form (X, Y, Z).
+const JACOBIAN_LIMBS: usize = 24;
+/// Limbs per point in affine form (x, y).
+const AFFINE_LIMBS: usize = 16;
 
 /// Convert 32 big-endian bytes to 8 little-endian u32 limbs (limb 0 = LSB).
 ///
@@ -108,6 +112,18 @@ fn add_u64_le(key: &mut [u32; 8], off: u64) {
             break;
         }
     }
+}
+
+/// Preferred work-group size for the throughput kernels. Kept as a tunable
+/// constant; 256 is a safe default for AMD RDNA2/3 and NVIDIA GPUs.
+const WORK_GROUP_SIZE: usize = 256;
+
+/// Build (global, local) work dimensions for a 1-D kernel over `batch` items.
+/// If `batch` is smaller than the work-group size we shrink the local size so
+/// the dispatch is still valid (global must be a multiple of local).
+fn work_dims(batch: usize) -> (SpatialDims, SpatialDims) {
+    let local = batch.clamp(1, WORK_GROUP_SIZE);
+    (SpatialDims::One(batch), SpatialDims::One(local))
 }
 
 /// Build the flat little-endian Montgomery-form precomputation table.
@@ -258,11 +274,14 @@ fn build_proque(platform: Platform, device: ocl::Device) -> Option<ProQue> {
 /// Probe a single private-key vector using `derive_points` + CPU-side keccak.
 /// `base_u32` is the 256-bit private key in little-endian u32 limbs. Work size
 /// is 1, so gid=0 and the probed key equals `base_u32`.
+#[allow(clippy::too_many_arguments)]
 fn probe_one_vector(
     proque: &ProQue,
     derive: &ocl::Kernel,
+    batch_affine: &ocl::Kernel,
     base_buf: &Buffer<u32>,
-    points: &Buffer<u32>,
+    _points: &Buffer<u32>,
+    affine: &Buffer<u32>,
     base_u32: &[u32; 8],
     expected: &[u8; 20],
 ) -> bool {
@@ -272,8 +291,23 @@ fn probe_one_vector(
     if proque.queue().finish().is_err() {
         return false;
     }
+    let (g_one, l_one) = work_dims(1);
     unsafe {
         if derive
+            .cmd()
+            .global_work_size(g_one)
+            .local_work_size(l_one)
+            .enq()
+            .is_err()
+        {
+            return false;
+        }
+    }
+    if proque.queue().finish().is_err() {
+        return false;
+    }
+    unsafe {
+        if batch_affine
             .cmd()
             .global_work_size(SpatialDims::One(1))
             .enq()
@@ -285,14 +319,14 @@ fn probe_one_vector(
     if proque.queue().finish().is_err() {
         return false;
     }
-    let mut pts = [0u32; 16];
-    if points.read(&mut pts[..]).enq().is_err() {
+    let mut pts = [0u32; AFFINE_LIMBS];
+    if affine.read(&mut pts[..]).enq().is_err() {
         return false;
     }
     if proque.queue().finish().is_err() {
         return false;
     }
-    // points holds big-endian x[8] then y[8]; build the uncompressed pubkey
+    // affine holds big-endian x[8] then y[8]; build the uncompressed pubkey
     // and hash on the CPU (reusing the trusted keccak path).
     let mut full = [0u8; 65];
     full[0] = 0x04;
@@ -353,7 +387,23 @@ fn probe_device(proque: &ProQue) -> bool {
     };
     let points = match Buffer::<u32>::builder()
         .queue(proque.queue().clone())
-        .len(16)
+        .len(JACOBIAN_LIMBS)
+        .build()
+    {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let affine = match Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(AFFINE_LIMBS)
+        .build()
+    {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let scratch = match Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(8)
         .build()
     {
         Ok(b) => b,
@@ -375,11 +425,31 @@ fn probe_device(proque: &ProQue) -> bool {
         Ok(k) => k,
         Err(_) => return false,
     };
+    let batch_affine = match proque
+        .kernel_builder("batch_affine")
+        .arg(&points)
+        .arg(&affine)
+        .arg(&scratch)
+        .arg(1u32)
+        .build()
+    {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
 
     // Vector 0: private key 1 (the generator).
     let mut base1 = [0u32; 8];
     base1[0] = 1;
-    if !probe_one_vector(proque, &derive, &base_buf, &points, &base1, &ADDR_KEY1) {
+    if !probe_one_vector(
+        proque,
+        &derive,
+        &batch_affine,
+        &base_buf,
+        &points,
+        &affine,
+        &base1,
+        &ADDR_KEY1,
+    ) {
         return false;
     }
 
@@ -389,7 +459,16 @@ fn probe_device(proque: &ProQue) -> bool {
         bytes[31] = *k;
         let base = bytes_to_u32x8_le(&bytes);
         let expected = privkey_to_address(&bytes).unwrap();
-        if !probe_one_vector(proque, &derive, &base_buf, &points, &base, &expected) {
+        if !probe_one_vector(
+            proque,
+            &derive,
+            &batch_affine,
+            &base_buf,
+            &points,
+            &affine,
+            &base,
+            &expected,
+        ) {
             eprintln!("[gpu] probe vector {} (key={}): GPU/CPU mismatch", v, k);
             return false;
         }
@@ -412,7 +491,16 @@ fn probe_device(proque: &ProQue) -> bool {
                 return false;
             }
         };
-        if !probe_one_vector(proque, &derive, &base_buf, &points, &base, &expected) {
+        if !probe_one_vector(
+            proque,
+            &derive,
+            &batch_affine,
+            &base_buf,
+            &points,
+            &affine,
+            &base,
+            &expected,
+        ) {
             eprintln!("[gpu] probe vector {}: GPU/CPU mismatch", v);
             return false;
         }
@@ -619,7 +707,15 @@ pub fn run_gpu(
         .build();
     let points = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
-        .len(batch * 16)
+        .len(batch * JACOBIAN_LIMBS)
+        .build();
+    let affine = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(batch * AFFINE_LIMBS)
+        .build();
+    let scratch = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(batch * 8)
         .build();
     let out_found = Buffer::<i32>::builder()
         .queue(proque.queue().clone())
@@ -637,10 +733,12 @@ pub fn run_gpu(
         .queue(proque.queue().clone())
         .len(params_len(pattern))
         .build();
-    let (base_buf, precomp, points, out_found, out_priv, out_addr, params) = match (
-        base_buf, precomp, points, out_found, out_priv, out_addr, params,
+    let (base_buf, precomp, points, affine, scratch, out_found, out_priv, out_addr, params) = match (
+        base_buf, precomp, points, affine, scratch, out_found, out_priv, out_addr, params,
     ) {
-        (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e), Ok(f), Ok(g)) => (a, b, c, d, e, f, g),
+        (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e), Ok(f), Ok(g), Ok(h), Ok(i)) => {
+            (a, b, c, d, e, f, g, h, i)
+        }
         _ => return Vec::new(),
     };
 
@@ -656,17 +754,24 @@ pub fn run_gpu(
         .arg(&precomp)
         .arg(&points)
         .build();
+    let batch_affine = proque
+        .kernel_builder("batch_affine")
+        .arg(&points)
+        .arg(&affine)
+        .arg(&scratch)
+        .arg(batch as u32)
+        .build();
     let matcher = proque
         .kernel_builder("hash_match")
         .arg(&base_buf)
-        .arg(&points)
+        .arg(&affine)
         .arg(&out_found)
         .arg(&out_priv)
         .arg(&out_addr)
         .arg(&params)
         .build();
-    let (derive, matcher) = match (derive, matcher) {
-        (Ok(d), Ok(m)) => (d, m),
+    let (derive, batch_affine, matcher) = match (derive, batch_affine, matcher) {
+        (Ok(d), Ok(ba), Ok(m)) => (d, ba, m),
         _ => return Vec::new(),
     };
 
@@ -744,10 +849,12 @@ pub fn run_gpu(
             iter_ok = false;
         }
         if iter_ok {
+            let (g, l) = work_dims(batch);
             unsafe {
                 if derive
                     .cmd()
-                    .global_work_size(SpatialDims::One(batch))
+                    .global_work_size(g)
+                    .local_work_size(l)
                     .enq()
                     .is_err()
                 {
@@ -760,9 +867,26 @@ pub fn run_gpu(
         }
         if iter_ok {
             unsafe {
+                if batch_affine
+                    .cmd()
+                    .global_work_size(SpatialDims::One(1))
+                    .enq()
+                    .is_err()
+                {
+                    iter_ok = false;
+                }
+            }
+        }
+        if iter_ok && proque.queue().finish().is_err() {
+            iter_ok = false;
+        }
+        if iter_ok {
+            let (g, l) = work_dims(batch);
+            unsafe {
                 if matcher
                     .cmd()
-                    .global_work_size(SpatialDims::One(batch))
+                    .global_work_size(g)
+                    .local_work_size(l)
                     .enq()
                     .is_err()
                 {
@@ -955,7 +1079,17 @@ pub fn self_test(selection: DeviceSelection) -> bool {
         .unwrap();
     let points = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
-        .len(16)
+        .len(JACOBIAN_LIMBS)
+        .build()
+        .unwrap();
+    let affine = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(AFFINE_LIMBS)
+        .build()
+        .unwrap();
+    let scratch = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(8)
         .build()
         .unwrap();
     let out_found = Buffer::<i32>::builder()
@@ -994,10 +1128,18 @@ pub fn self_test(selection: DeviceSelection) -> bool {
         .arg(&points)
         .build()
         .unwrap();
+    let batch_affine = proque
+        .kernel_builder("batch_affine")
+        .arg(&points)
+        .arg(&affine)
+        .arg(&scratch)
+        .arg(1u32)
+        .build()
+        .unwrap();
     let matcher = proque
         .kernel_builder("hash_match")
         .arg(&base_buf)
-        .arg(&points)
+        .arg(&affine)
         .arg(&out_found)
         .arg(&out_priv)
         .arg(&out_addr)
@@ -1036,8 +1178,18 @@ pub fn self_test(selection: DeviceSelection) -> bool {
         out_found.write(&zero[..]).enq().unwrap();
         proque.queue().finish().unwrap();
 
+        let (g_one, l_one) = work_dims(1);
         unsafe {
             derive
+                .cmd()
+                .global_work_size(g_one)
+                .local_work_size(l_one)
+                .enq()
+                .unwrap();
+        }
+        proque.queue().finish().unwrap();
+        unsafe {
+            batch_affine
                 .cmd()
                 .global_work_size(SpatialDims::One(1))
                 .enq()
@@ -1047,7 +1199,8 @@ pub fn self_test(selection: DeviceSelection) -> bool {
         unsafe {
             matcher
                 .cmd()
-                .global_work_size(SpatialDims::One(1))
+                .global_work_size(g_one)
+                .local_work_size(l_one)
                 .enq()
                 .unwrap();
         }
@@ -1112,7 +1265,17 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
         .ok()?;
     let points = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
-        .len(batch * 16)
+        .len(batch * JACOBIAN_LIMBS)
+        .build()
+        .ok()?;
+    let affine = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(batch * AFFINE_LIMBS)
+        .build()
+        .ok()?;
+    let scratch = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(batch * 8)
         .build()
         .ok()?;
     let out_found = Buffer::<i32>::builder()
@@ -1146,10 +1309,18 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
         .arg(&points)
         .build()
         .ok()?;
+    let batch_affine = proque
+        .kernel_builder("batch_affine")
+        .arg(&points)
+        .arg(&affine)
+        .arg(&scratch)
+        .arg(batch as u32)
+        .build()
+        .ok()?;
     let matcher = proque
         .kernel_builder("hash_match")
         .arg(&base_buf)
-        .arg(&points)
+        .arg(&affine)
         .arg(&out_found)
         .arg(&out_priv)
         .arg(&out_addr)
@@ -1174,10 +1345,20 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
         let zero = [0i32];
         out_found.write(&zero[..]).enq().ok()?;
         proque.queue().finish().ok()?;
+        let (g, l) = work_dims(batch);
         unsafe {
             derive
                 .cmd()
-                .global_work_size(SpatialDims::One(batch))
+                .global_work_size(g)
+                .local_work_size(l)
+                .enq()
+                .ok()?;
+        }
+        proque.queue().finish().ok()?;
+        unsafe {
+            batch_affine
+                .cmd()
+                .global_work_size(SpatialDims::One(1))
                 .enq()
                 .ok()?;
         }
@@ -1185,7 +1366,8 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
         unsafe {
             matcher
                 .cmd()
-                .global_work_size(SpatialDims::One(batch))
+                .global_work_size(g)
+                .local_work_size(l)
                 .enq()
                 .ok()?;
         }

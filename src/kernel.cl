@@ -54,9 +54,6 @@ static inline int fe_is_zero(const uint* a) {
 // P is copied to a local __private array so the inner loop only references
 // __private pointers (CL 1.2 compatible).
 static void mont_mul(uint* r, const uint* a, const uint* b) {
-    uint P_loc[8];
-    for (int j = 0; j < 8; j++) P_loc[j] = P[j];
-
     uint64_t t[10];
     for (int i = 0; i < 10; i++) t[i] = 0;
 
@@ -75,7 +72,7 @@ static void mont_mul(uint* r, const uint* a, const uint* b) {
 
         carry = 0;
         for (int j = 0; j < 8; j++) {
-            v = t[j] + (uint64_t)m * (uint64_t)P_loc[j] + carry;
+            v = t[j] + (uint64_t)m * (uint64_t)P[j] + carry;
             if (j >= 1) t[j - 1] = v & 0xFFFFFFFFULL;
             carry = v >> 32;
         }
@@ -89,10 +86,10 @@ static void mont_mul(uint* r, const uint* a, const uint* b) {
 
     for (int j = 0; j < 8; j++) r[j] = (uint)t[j];
     // Final reduction: t[8] is 0 or 1; subtract p once if >= p.
-    if (t[8] > 0 || fe_ge(r, P_loc)) {
+    if (t[8] > 0 || fe_ge(r, P)) {
         int64_t borrow = 0;
         for (int j = 0; j < 8; j++) {
-            int64_t cur = (int64_t)r[j] - (int64_t)P_loc[j] - borrow;
+            int64_t cur = (int64_t)r[j] - (int64_t)P[j] - borrow;
             if (cur < 0) { r[j] = (uint)(cur + (1LL << 32)); borrow = 1; }
             else { r[j] = (uint)cur; borrow = 0; }
         }
@@ -103,9 +100,6 @@ static void mont_sqr(uint* r, const uint* a) { mont_mul(r, a, a); }
 
 // Montgomery addition (a + b) mod p, with a 9th carry limb.
 static void mont_add(uint* r, const uint* a, const uint* b) {
-    uint P_loc[8];
-    for (int j = 0; j < 8; j++) P_loc[j] = P[j];
-
     uint64_t t[9];
     uint64_t carry = 0;
     for (int i = 0; i < 8; i++) {
@@ -114,10 +108,10 @@ static void mont_add(uint* r, const uint* a, const uint* b) {
         carry = v >> 32;
     }
     t[8] = carry;
-    if (t[8] > 0 || fe_ge((uint*)t, P_loc)) {
+    if (t[8] > 0 || fe_ge((uint*)t, P)) {
         int64_t borrow = 0;
         for (int i = 0; i < 8; i++) {
-            int64_t cur = (int64_t)t[i] - (int64_t)P_loc[i] - borrow;
+            int64_t cur = (int64_t)t[i] - (int64_t)P[i] - borrow;
             if (cur < 0) { t[i] = (uint64_t)(cur + (1LL << 32)); borrow = 1; }
             else { t[i] = (uint64_t)cur; borrow = 0; }
         }
@@ -127,9 +121,6 @@ static void mont_add(uint* r, const uint* a, const uint* b) {
 
 // Montgomery subtraction (a - b) mod p.
 static void mont_sub(uint* r, const uint* a, const uint* b) {
-    uint P_loc[8];
-    for (int j = 0; j < 8; j++) P_loc[j] = P[j];
-
     int64_t borrow = 0;
     for (int i = 0; i < 8; i++) {
         int64_t cur = (int64_t)a[i] - (int64_t)b[i] - borrow;
@@ -139,7 +130,7 @@ static void mont_sub(uint* r, const uint* a, const uint* b) {
     if (borrow > 0) {
         uint64_t carry = 0;
         for (int i = 0; i < 8; i++) {
-            uint64_t v = (uint64_t)r[i] + (uint64_t)P_loc[i] + carry;
+            uint64_t v = (uint64_t)r[i] + (uint64_t)P[i] + carry;
             r[i] = (uint)(v & 0xFFFFFFFFULL);
             carry = v >> 32;
         }
@@ -150,11 +141,8 @@ static void mont_sub(uint* r, const uint* a, const uint* b) {
 static void mont_double(uint* r, const uint* a) { mont_add(r, a, a); }
 
 // Convert canonical -> Montgomery form (multiply by R^2).
-// R2_MONT is __constant, copy to local __private before passing to mont_mul.
 static void to_mont(uint* r, const uint* a) {
-    uint R2_loc[8];
-    for (int j = 0; j < 8; j++) R2_loc[j] = R2_MONT[j];
-    mont_mul(r, a, R2_loc);
+    mont_mul(r, a, R2_MONT);
 }
 
 // Convert Montgomery -> canonical form (multiply by 1).
@@ -164,15 +152,11 @@ static void from_mont(uint* r, const uint* a) {
 }
 
 // Modular inverse via Fermat: a^-1 = a^(p-2), MSB-first square-and-multiply.
-// R_MONT is __constant, copy to local __private before use.
 static void fe_inv(uint* r, const uint* a) {
-    uint R_loc[8];
-    for (int j = 0; j < 8; j++) R_loc[j] = R_MONT[j];
-
     uint e[8] = { 0xFFFFFC2Du, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu,
                   0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
     uint res[8];
-    for (int i = 0; i < 8; i++) res[i] = R_loc[i];
+    for (int i = 0; i < 8; i++) res[i] = R_MONT[i];
     for (int i = 7; i >= 0; i--) {
         for (int bit = 31; bit >= 0; bit--) {
             uint t[8];
@@ -226,15 +210,11 @@ static void j_double(uint* RX, uint* RY, uint* RZ,
 }
 
 // Mixed Jacobian + affine addition R = P(Jacobian) + Q(affine), no inversion.
-// R_MONT is __constant, copy to local __private before use.
 static void j_add_mixed(uint* RX, uint* RY, uint* RZ,
                         const uint* PX, const uint* PY, const uint* PZ,
                         const uint* qx, const uint* qy) {
-    uint R_loc[8];
-    for (int j = 0; j < 8; j++) R_loc[j] = R_MONT[j];
-
     if (fe_is_zero(PZ)) {
-        for (int i = 0; i < 8; i++) { RX[i] = qx[i]; RY[i] = qy[i]; RZ[i] = R_loc[i]; }
+        for (int i = 0; i < 8; i++) { RX[i] = qx[i]; RY[i] = qy[i]; RZ[i] = R_MONT[i]; }
         return;
     }
     uint z1z1[8], u2[8], s2[8], h[8], r[8], z1cubed[8];
@@ -390,16 +370,25 @@ static uint key_byte(const uint* key, int i) {
     return (key[word] >> shift) & 0xFFu;
 }
 
+// Extract the i-th nibble (4 bits) of a key, in big-endian order
+// (i == 0 is the most-significant nibble, i == 63 the least-significant).
+static uint key_nibble(const uint* key, int i) {
+    uint byte = key_byte(key, i / 2);
+    return (i % 2 == 0) ? ((byte >> 4) & 0xFu) : (byte & 0xFu);
+}
+
 // ---- kernels --------------------------------------------------------------
 
-// precomp layout: 32 columns x 255 points x 16 u32 (x[8] then y[8]), all in
-// Montgomery form. column i holds (b * 256^(31-i)) * G for b = 1..255.
+// precomp layout: 64 columns x 15 points x 16 u32 (x[8] then y[8]), all in
+// Montgomery form. column i holds (b * 16^(63-i)) * G for b = 1..15.
 //
-// derive_points: for each work item, compute (base+gid)*G and emit the affine
-// public key as 16 big-endian u32 (x[8] then y[8], x[0] most significant).
+// derive_points: for each work item, compute (base+gid)*G and emit the Jacobian
+// result as 24 little-endian u32 (X[8] then Y[8] then Z[8]). Affine conversion
+// and de-Montgomery are done in a separate batch-inversion kernel so the whole
+// batch shares a single modular inverse (Montgomery's trick).
 __kernel void derive_points(__global uint* restrict base,
                             __global const uint* restrict precomp,
-                            __global uint* restrict out) {
+                            __global uint* restrict out_jac) {
     size_t gid = get_global_id(0);
 
     uint key[8];
@@ -409,32 +398,98 @@ __kernel void derive_points(__global uint* restrict base,
     uint RX[8], RY[8], RZ[8];
     for (int i = 0; i < 8; i++) { RX[i] = 0; RY[i] = 0; RZ[i] = 0; }
 
-    for (int i = 0; i < 32; i++) {
-        uint byte = key_byte(key, i);
-        if (byte != 0) {
+    for (int i = 0; i < 64; i++) {
+        uint nibble = key_nibble(key, i);
+        if (nibble != 0) {
             uint qx[8], qy[8];
-            uint off = (uint)i * 255u * 16u + (byte - 1u) * 16u;
+            uint off = (uint)i * 15u * 16u + (nibble - 1u) * 16u;
             for (int k = 0; k < 8; k++) {
                 qx[k] = precomp[off + k];
                 qy[k] = precomp[off + 8 + k];
             }
-            uint TX[8], TY[8], TZ[8];
-            j_add_mixed(TX, TY, TZ, RX, RY, RZ, qx, qy);
-            for (int k = 0; k < 8; k++) { RX[k] = TX[k]; RY[k] = TY[k]; RZ[k] = TZ[k]; }
+            j_add_mixed(RX, RY, RZ, RX, RY, RZ, qx, qy);
         }
     }
 
-    // Affine conversion, then de-Montgomery, then emit big-endian u32.
-    uint ax[8], ay[8];
-    j_to_affine(ax, ay, RX, RY, RZ);
-    uint cx[8], cy[8];
-    from_mont(cx, ax);
-    from_mont(cy, ay);
-
-    size_t off = gid * 16;
+    size_t off = gid * 24;
     for (int k = 0; k < 8; k++) {
-        out[off + k]     = cx[7 - k]; // little-endian cx -> big-endian out
-        out[off + 8 + k] = cy[7 - k];
+        out_jac[off + k]     = RX[k];
+        out_jac[off + 8 + k] = RY[k];
+        out_jac[off + 16 + k] = RZ[k];
+    }
+}
+
+// Batch affine conversion using Montgomery's trick: for a batch of Jacobian
+// points (X_i, Y_i, Z_i) compute the affine (x_i, y_i) with only one modular
+// inverse for the entire batch.
+//
+// Inputs : out_jac[batch * 24] little-endian Jacobian points.
+// Outputs: out_affine[batch * 16] big-endian x[8] then y[8].
+// Scratch: scratch[batch * 8] prefix products (internal).
+__attribute__((reqd_work_group_size(1, 1, 1)))
+__kernel void batch_affine(__global const uint* restrict jac,
+                           __global uint* restrict out_affine,
+                           __global uint* restrict scratch,
+                           uint batch) {
+    if (batch == 0) return;
+
+    // Forward pass: scratch[i] = prod_{j=0..i} Z_j.
+    uint prod[8];
+    for (uint i = 0; i < batch; i++) {
+        uint z[8];
+        size_t base = (size_t)i * 24 + 16;
+        for (int k = 0; k < 8; k++) z[k] = jac[base + k];
+        if (i == 0) {
+            for (int k = 0; k < 8; k++) prod[k] = z[k];
+        } else {
+            mont_mul(prod, z, prod);
+        }
+        size_t soff = (size_t)i * 8;
+        for (int k = 0; k < 8; k++) scratch[soff + k] = prod[k];
+    }
+
+    // Single inverse of the total product.
+    uint inv[8];
+    fe_inv(inv, prod);
+
+    // Backward pass: derive each Z_i^-1 and convert to affine.
+    for (int idx = (int)batch - 1; idx >= 0; idx--) {
+        uint z[8];
+        size_t jbase = (size_t)idx * 24 + 16;
+        for (int k = 0; k < 8; k++) z[k] = jac[jbase + k];
+
+        uint z_inv[8];
+        if (idx > 0) {
+            uint pprev[8];
+            size_t soff = (size_t)(idx - 1) * 8;
+            for (int k = 0; k < 8; k++) pprev[k] = scratch[soff + k];
+            mont_mul(z_inv, inv, pprev);
+        } else {
+            for (int k = 0; k < 8; k++) z_inv[k] = inv[k];
+        }
+
+        uint z2_inv[8], z3_inv[8], ax[8], ay[8];
+        mont_sqr(z2_inv, z_inv);
+        mont_mul(z3_inv, z2_inv, z_inv);
+
+        size_t xybase = (size_t)idx * 24;
+        mont_mul(ax, &jac[xybase], z2_inv);
+        mont_mul(ay, &jac[xybase + 8], z3_inv);
+
+        uint cx[8], cy[8];
+        from_mont(cx, ax);
+        from_mont(cy, ay);
+
+        size_t obase = (size_t)idx * 16;
+        for (int k = 0; k < 8; k++) {
+            out_affine[obase + k]     = cx[7 - k];
+            out_affine[obase + 8 + k] = cy[7 - k];
+        }
+
+        // inv = inv * Z_idx for the next (more significant) position.
+        uint t[8];
+        mont_mul(t, inv, z);
+        for (int k = 0; k < 8; k++) inv[k] = t[k];
     }
 }
 
