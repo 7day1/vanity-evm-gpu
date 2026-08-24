@@ -13,6 +13,7 @@ pub mod config;
 pub mod cpu_worker;
 pub mod crypto;
 pub mod gpu;
+pub mod mont;
 pub mod output;
 pub mod progress;
 
