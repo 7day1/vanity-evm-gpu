@@ -14,6 +14,13 @@
 // (a*R mod p). This is a verbatim port of src/mont.rs and src/ec.rs, which
 // are proven correct on the CPU against num-bigint and the secp256k1 crate.
 //
+// OpenCL C 1.2 compatibility: AMD's comgr on gfx1031 (RX 6000 series) compiles
+// with -cl-std=CL1.2 by default and rejects the C 2.0 __generic qualifier.
+// We keep every helper's pointer params in the default __private address
+// space. The field constants P / R_MONT / R2_MONT are __constant, so each
+// helper that references them copies them into a local __private array at
+// function entry (8 u32 = 32 bytes, negligible compared to the multiply).
+//
 // Kernel pipeline (2 kernels):
 //   derive_points : byte-windowed point-mul + affine conversion -> (x,y) bytes
 //   hash_match    : keccak256(x||y) -> EVM address, prefix/suffix match
@@ -30,28 +37,26 @@ constant uint R2_MONT[8] = { 0xE90A1u, 0x7A2u, 0x1u, 0, 0, 0, 0, 0 }; // R^2 = 2
 
 // ---- field helpers --------------------------------------------------------
 
-// All input pointer parameters use __generic so the helpers can be called
-// with both __private (stack/local arrays) and __constant (P, R2_MONT, …)
-// pointers. AMD's comgr strictly enforces pointer address space in static
-// helpers — without __generic a call like `fe_ge(r, P)` fails with
-// "changed address space of pointer". OpenCL 2.0+ is required; the kernel
-// is rejected on devices that only speak 1.2 by the same probe that already
-// skips Mac integrated GPUs.
-static inline int fe_ge(const __generic uint* a, const __generic uint* b) {
+static inline int fe_ge(const uint* a, const uint* b) {
     for (int i = 7; i >= 0; i--) {
         if (a[i] > b[i]) return 1;
         if (a[i] < b[i]) return 0;
     }
     return 1; // equal
 }
-static inline int fe_is_zero(const __generic uint* a) {
+static inline int fe_is_zero(const uint* a) {
     for (int i = 0; i < 8; i++) if (a[i]) return 0;
     return 1;
 }
 
 // Montgomery multiply (CIOS): r = a * b * R^-1 mod p.
 // Verbatim port of src/mont.rs::mont_mul (10-limb accumulator).
-static void mont_mul(uint* r, const __generic uint* a, const __generic uint* b) {
+// P is copied to a local __private array so the inner loop only references
+// __private pointers (CL 1.2 compatible).
+static void mont_mul(uint* r, const uint* a, const uint* b) {
+    uint P_loc[8];
+    for (int j = 0; j < 8; j++) P_loc[j] = P[j];
+
     uint64_t t[10];
     for (int i = 0; i < 10; i++) t[i] = 0;
 
@@ -70,7 +75,7 @@ static void mont_mul(uint* r, const __generic uint* a, const __generic uint* b) 
 
         carry = 0;
         for (int j = 0; j < 8; j++) {
-            v = t[j] + (uint64_t)m * (uint64_t)P[j] + carry;
+            v = t[j] + (uint64_t)m * (uint64_t)P_loc[j] + carry;
             if (j >= 1) t[j - 1] = v & 0xFFFFFFFFULL;
             carry = v >> 32;
         }
@@ -84,20 +89,23 @@ static void mont_mul(uint* r, const __generic uint* a, const __generic uint* b) 
 
     for (int j = 0; j < 8; j++) r[j] = (uint)t[j];
     // Final reduction: t[8] is 0 or 1; subtract p once if >= p.
-    if (t[8] > 0 || fe_ge(r, P)) {
+    if (t[8] > 0 || fe_ge(r, P_loc)) {
         int64_t borrow = 0;
         for (int j = 0; j < 8; j++) {
-            int64_t cur = (int64_t)r[j] - (int64_t)P[j] - borrow;
+            int64_t cur = (int64_t)r[j] - (int64_t)P_loc[j] - borrow;
             if (cur < 0) { r[j] = (uint)(cur + (1LL << 32)); borrow = 1; }
             else { r[j] = (uint)cur; borrow = 0; }
         }
     }
 }
 
-static void mont_sqr(uint* r, const __generic uint* a) { mont_mul(r, a, a); }
+static void mont_sqr(uint* r, const uint* a) { mont_mul(r, a, a); }
 
 // Montgomery addition (a + b) mod p, with a 9th carry limb.
-static void mont_add(uint* r, const __generic uint* a, const __generic uint* b) {
+static void mont_add(uint* r, const uint* a, const uint* b) {
+    uint P_loc[8];
+    for (int j = 0; j < 8; j++) P_loc[j] = P[j];
+
     uint64_t t[9];
     uint64_t carry = 0;
     for (int i = 0; i < 8; i++) {
@@ -106,10 +114,10 @@ static void mont_add(uint* r, const __generic uint* a, const __generic uint* b) 
         carry = v >> 32;
     }
     t[8] = carry;
-    if (t[8] > 0 || fe_ge((uint*)t, P)) {
+    if (t[8] > 0 || fe_ge((uint*)t, P_loc)) {
         int64_t borrow = 0;
         for (int i = 0; i < 8; i++) {
-            int64_t cur = (int64_t)t[i] - (int64_t)P[i] - borrow;
+            int64_t cur = (int64_t)t[i] - (int64_t)P_loc[i] - borrow;
             if (cur < 0) { t[i] = (uint64_t)(cur + (1LL << 32)); borrow = 1; }
             else { t[i] = (uint64_t)cur; borrow = 0; }
         }
@@ -118,7 +126,10 @@ static void mont_add(uint* r, const __generic uint* a, const __generic uint* b) 
 }
 
 // Montgomery subtraction (a - b) mod p.
-static void mont_sub(uint* r, const __generic uint* a, const __generic uint* b) {
+static void mont_sub(uint* r, const uint* a, const uint* b) {
+    uint P_loc[8];
+    for (int j = 0; j < 8; j++) P_loc[j] = P[j];
+
     int64_t borrow = 0;
     for (int i = 0; i < 8; i++) {
         int64_t cur = (int64_t)a[i] - (int64_t)b[i] - borrow;
@@ -128,7 +139,7 @@ static void mont_sub(uint* r, const __generic uint* a, const __generic uint* b) 
     if (borrow > 0) {
         uint64_t carry = 0;
         for (int i = 0; i < 8; i++) {
-            uint64_t v = (uint64_t)r[i] + (uint64_t)P[i] + carry;
+            uint64_t v = (uint64_t)r[i] + (uint64_t)P_loc[i] + carry;
             r[i] = (uint)(v & 0xFFFFFFFFULL);
             carry = v >> 32;
         }
@@ -136,23 +147,32 @@ static void mont_sub(uint* r, const __generic uint* a, const __generic uint* b) 
 }
 
 // Montgomery doubling (== mont_add(a, a)).
-static void mont_double(uint* r, const __generic uint* a) { mont_add(r, a, a); }
+static void mont_double(uint* r, const uint* a) { mont_add(r, a, a); }
 
 // Convert canonical -> Montgomery form (multiply by R^2).
-static void to_mont(uint* r, const __generic uint* a) { mont_mul(r, a, R2_MONT); }
+// R2_MONT is __constant, copy to local __private before passing to mont_mul.
+static void to_mont(uint* r, const uint* a) {
+    uint R2_loc[8];
+    for (int j = 0; j < 8; j++) R2_loc[j] = R2_MONT[j];
+    mont_mul(r, a, R2_loc);
+}
 
 // Convert Montgomery -> canonical form (multiply by 1).
-static void from_mont(uint* r, const __generic uint* a) {
+static void from_mont(uint* r, const uint* a) {
     uint one[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
     mont_mul(r, a, one);
 }
 
 // Modular inverse via Fermat: a^-1 = a^(p-2), MSB-first square-and-multiply.
-static void fe_inv(uint* r, const __generic uint* a) {
+// R_MONT is __constant, copy to local __private before use.
+static void fe_inv(uint* r, const uint* a) {
+    uint R_loc[8];
+    for (int j = 0; j < 8; j++) R_loc[j] = R_MONT[j];
+
     uint e[8] = { 0xFFFFFC2Du, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu,
                   0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
     uint res[8];
-    for (int i = 0; i < 8; i++) res[i] = R_MONT[i];
+    for (int i = 0; i < 8; i++) res[i] = R_loc[i];
     for (int i = 7; i >= 0; i--) {
         for (int bit = 31; bit >= 0; bit--) {
             uint t[8];
@@ -172,7 +192,7 @@ static void fe_inv(uint* r, const __generic uint* a) {
 
 // Jacobian doubling R = 2*P (secp256k1 a=0).
 static void j_double(uint* RX, uint* RY, uint* RZ,
-                     const __generic uint* PX, const __generic uint* PY, const __generic uint* PZ) {
+                     const uint* PX, const uint* PY, const uint* PZ) {
     if (fe_is_zero(PZ) || fe_is_zero(PY)) {
         for (int i = 0; i < 8; i++) { RX[i] = 0; RY[i] = 0; RZ[i] = 0; }
         return;
@@ -206,11 +226,15 @@ static void j_double(uint* RX, uint* RY, uint* RZ,
 }
 
 // Mixed Jacobian + affine addition R = P(Jacobian) + Q(affine), no inversion.
+// R_MONT is __constant, copy to local __private before use.
 static void j_add_mixed(uint* RX, uint* RY, uint* RZ,
-                        const __generic uint* PX, const __generic uint* PY, const __generic uint* PZ,
-                        const __generic uint* qx, const __generic uint* qy) {
+                        const uint* PX, const uint* PY, const uint* PZ,
+                        const uint* qx, const uint* qy) {
+    uint R_loc[8];
+    for (int j = 0; j < 8; j++) R_loc[j] = R_MONT[j];
+
     if (fe_is_zero(PZ)) {
-        for (int i = 0; i < 8; i++) { RX[i] = qx[i]; RY[i] = qy[i]; RZ[i] = R_MONT[i]; }
+        for (int i = 0; i < 8; i++) { RX[i] = qx[i]; RY[i] = qy[i]; RZ[i] = R_loc[i]; }
         return;
     }
     uint z1z1[8], u2[8], s2[8], h[8], r[8], z1cubed[8];
@@ -258,7 +282,7 @@ static void j_add_mixed(uint* RX, uint* RY, uint* RZ,
 
 // Convert Jacobian to affine (Montgomery form): x = X/Z^2, y = Y/Z^3.
 static void j_to_affine(uint* Qx, uint* Qy,
-                        const __generic uint* X, const __generic uint* Y, const __generic uint* Z) {
+                        const uint* X, const uint* Y, const uint* Z) {
     if (fe_is_zero(Z)) {
         for (int i = 0; i < 8; i++) { Qx[i] = 0; Qy[i] = 0; }
         return;
