@@ -22,7 +22,5 @@ pub mod progress;
 pub use config::Pattern;
 pub use cpu_worker::{run_cpu, Match as CpuMatch};
 pub use gpu::{run_gpu, GpuMatch};
-// Experimental Radeon multi-dispatch path (gated — see gpu.rs).
-pub use gpu::radeon_self_test;
 pub use output::Found;
 pub use progress::{Progress, ProgressCb};

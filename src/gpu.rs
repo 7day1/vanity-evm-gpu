@@ -3,9 +3,7 @@
 //! accepting it. Includes `--self-test` to validate the kernel against the CPU.
 
 use crate::config::Pattern;
-use crate::crypto::{
-    add_u64_be, bytes_to_u32x8, privkey_to_address, reduce_mod_n, u32x8_to_bytes, zeroize_key,
-};
+use crate::crypto::{privkey_to_address, reduce_mod_n, zeroize_key};
 use crate::progress::{Progress, ProgressCb};
 use ocl::{Buffer, Device, DeviceType, Platform, ProQue, SpatialDims};
 use rand::rngs::OsRng;
@@ -13,6 +11,61 @@ use rand::RngCore;
 use std::collections::HashSet;
 use std::path::Path;
 use zeroize::ZeroizeOnDrop;
+
+/// Number of u32 limbs in a precomputed table point (x[8] + y[8]).
+const PRECOMP_POINT_LIMBS: usize = 16;
+/// Number of columns (byte positions) in the byte-windowed table.
+const PRECOMP_COLUMNS: usize = 32;
+/// Number of non-zero byte values per column.
+const PRECOMP_VALUES: usize = 255;
+/// Total u32 limbs in the precomputed table.
+const PRECOMP_LIMBS: usize = PRECOMP_COLUMNS * PRECOMP_VALUES * PRECOMP_POINT_LIMBS;
+
+/// Convert 32 bytes to 8 little-endian u32 limbs (limb 0 = least significant).
+fn bytes_to_u32x8_le(b: &[u8; 32]) -> [u32; 8] {
+    let mut out = [0u32; 8];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+    }
+    out
+}
+
+/// Convert 8 little-endian u32 limbs back to 32 bytes.
+fn u32x8_le_to_bytes(limbs: &[u32; 8]) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    for (i, w) in limbs.iter().enumerate() {
+        b[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    b
+}
+
+/// Add a u64 offset to a little-endian 8-limb key (advance the search base).
+fn add_u64_le(key: &mut [u32; 8], off: u64) {
+    let mut carry = off;
+    for w in key.iter_mut() {
+        let s = *w as u64 + carry;
+        *w = s as u32;
+        carry = s >> 32;
+        if carry == 0 {
+            break;
+        }
+    }
+}
+
+/// Build the flat little-endian Montgomery-form precomputation table.
+/// Returned length is `PRECOMP_LIMBS` (32 columns x 255 points x 16 limbs).
+fn build_precomp() -> Vec<u32> {
+    let table = crate::ec::generate_precomp();
+    let mut flat = Vec::with_capacity(PRECOMP_LIMBS);
+    for col in &table {
+        for point in col {
+            flat.extend_from_slice(&point.x);
+            flat.extend_from_slice(&point.y);
+        }
+    }
+    debug_assert_eq!(flat.len(), PRECOMP_LIMBS);
+    flat
+}
 
 /// Result of a GPU match. Zeroized on drop (defense-in-depth).
 #[derive(ZeroizeOnDrop)]
@@ -144,15 +197,14 @@ fn build_proque(platform: Platform, device: ocl::Device) -> Option<ProQue> {
         .ok()
 }
 
-/// Probe a single private-key vector on the already-built buffers/kernels.
-/// `base_u32` is the 256-bit private key in big-endian u32 chunks. The work
-/// size is always 1, so gid=0 and the probed key equals `base_u32`.
+/// Probe a single private-key vector using `derive_points` + CPU-side keccak.
+/// `base_u32` is the 256-bit private key in little-endian u32 limbs. Work size
+/// is 1, so gid=0 and the probed key equals `base_u32`.
 fn probe_one_vector(
     proque: &ProQue,
     derive: &ocl::Kernel,
-    hash: &ocl::Kernel,
     base_buf: &Buffer<u32>,
-    addrs: &Buffer<u8>,
+    points: &Buffer<u32>,
     base_u32: &[u32; 8],
     expected: &[u8; 20],
 ) -> bool {
@@ -175,37 +227,30 @@ fn probe_one_vector(
     if proque.queue().finish().is_err() {
         return false;
     }
-    unsafe {
-        if hash
-            .cmd()
-            .global_work_size(SpatialDims::One(1))
-            .enq()
-            .is_err()
-        {
-            return false;
-        }
-    }
-    if proque.queue().finish().is_err() {
-        return false;
-    }
-    let mut got = [0u8; 20];
-    if addrs.read(&mut got[..]).enq().is_err() {
+    let mut pts = [0u32; 16];
+    if points.read(&mut pts[..]).enq().is_err() {
         return false;
     }
     if proque.queue().finish().is_err() {
         return false;
     }
+    // points holds big-endian x[8] then y[8]; build the uncompressed pubkey
+    // and hash on the CPU (reusing the trusted keccak path).
+    let mut full = [0u8; 65];
+    full[0] = 0x04;
+    for i in 0..8 {
+        full[1 + 4 * i..1 + 4 * i + 4].copy_from_slice(&pts[i].to_be_bytes());
+        full[33 + 4 * i..33 + 4 * i + 4].copy_from_slice(&pts[8 + i].to_be_bytes());
+    }
+    let got = crate::crypto::pubkey_to_address(&full);
     got == *expected
 }
 
 /// Kernel/device reliability probe.
 ///
-/// The Apple/Radeon Pro 560X driver historically miscompiled the affine
-/// scalar-multiplication path for non-trivial private keys, even though the
-/// trivial key=1 (the generator itself) happened to pass. With the Jacobian
-/// kernel this should no longer happen, but we keep a multi-vector probe as a
-/// runtime safety net so any driver-level regression is caught before we trust
-/// the device.
+/// Verifies the byte-windowed Montgomery point-multiplication kernel against
+/// the CPU on known and random private keys, so a driver-level regression is
+/// caught before we trust the device.
 fn probe_device(proque: &ProQue) -> bool {
     let base_buf = match Buffer::<u32>::builder()
         .queue(proque.queue().clone())
@@ -215,7 +260,15 @@ fn probe_device(proque: &ProQue) -> bool {
         Ok(b) => b,
         Err(_) => return false,
     };
-    let pubs = match Buffer::<u32>::builder()
+    let precomp = match Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(PRECOMP_LIMBS)
+        .build()
+    {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let points = match Buffer::<u32>::builder()
         .queue(proque.queue().clone())
         .len(16)
         .build()
@@ -223,64 +276,49 @@ fn probe_device(proque: &ProQue) -> bool {
         Ok(b) => b,
         Err(_) => return false,
     };
-    let addrs = match Buffer::<u8>::builder()
-        .queue(proque.queue().clone())
-        .len(20)
-        .build()
-    {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
+    if precomp.write(&build_precomp()[..]).enq().is_err() {
+        return false;
+    }
+    if proque.queue().finish().is_err() {
+        return false;
+    }
     let derive = match proque
-        .kernel_builder("derive_pubkeys")
+        .kernel_builder("derive_points")
         .arg(&base_buf)
-        .arg(&pubs)
-        .build()
-    {
-        Ok(k) => k,
-        Err(_) => return false,
-    };
-    let hash = match proque
-        .kernel_builder("hash_addrs")
-        .arg(&pubs)
-        .arg(&addrs)
+        .arg(&precomp)
+        .arg(&points)
         .build()
     {
         Ok(k) => k,
         Err(_) => return false,
     };
 
-    // Vector 0: private key 1.
+    // Vector 0: private key 1 (the generator).
     let mut base1 = [0u32; 8];
-    base1[7] = 1;
-    if !probe_one_vector(
-        proque, &derive, &hash, &base_buf, &addrs, &base1, &ADDR_KEY1,
-    ) {
+    base1[0] = 1;
+    if !probe_one_vector(proque, &derive, &base_buf, &points, &base1, &ADDR_KEY1) {
         return false;
     }
 
-    // Diagnostic vectors: key=2 (tests Jacobian doubling), key=3 (tests
-    // doubling + mixed addition). Keep these even in release until we are sure
-    // the Jacobian path is solid.
+    // Diagnostic vectors: key=2 (doubling), key=3 (doubling + addition).
     for (v, k) in [(1u32, 2u8), (2, 3)].iter() {
         let mut bytes = [0u8; 32];
         bytes[31] = *k;
-        let base = bytes_to_u32x8(&bytes);
+        let base = bytes_to_u32x8_le(&bytes);
         let expected = privkey_to_address(&bytes).unwrap();
-        if !probe_one_vector(proque, &derive, &hash, &base_buf, &addrs, &base, &expected) {
+        if !probe_one_vector(proque, &derive, &base_buf, &points, &base, &expected) {
             eprintln!("[gpu] probe vector {} (key={}): GPU/CPU mismatch", v, k);
             return false;
         }
     }
 
-    // Vectors 3..N: random private keys. Non-trivial scalars exercise the
-    // full Jacobian double/add path, which is the real reliability gate.
+    // Vectors 3..N: random private keys (non-trivial scalars).
     let mut rng = OsRng;
     const RANDOM_VECTORS: usize = 4;
     for v in 3..=RANDOM_VECTORS + 2 {
         let mut bytes = [0u8; 32];
         rng.fill_bytes(&mut bytes);
-        let base = bytes_to_u32x8(&bytes);
+        let base = bytes_to_u32x8_le(&bytes);
         let expected = match privkey_to_address(&bytes) {
             Some(a) => a,
             None => {
@@ -291,7 +329,7 @@ fn probe_device(proque: &ProQue) -> bool {
                 return false;
             }
         };
-        if !probe_one_vector(proque, &derive, &hash, &base_buf, &addrs, &base, &expected) {
+        if !probe_one_vector(proque, &derive, &base_buf, &points, &base, &expected) {
             eprintln!("[gpu] probe vector {}: GPU/CPU mismatch", v);
             return false;
         }
@@ -492,13 +530,13 @@ pub fn run_gpu(
         .queue(proque.queue().clone())
         .len(8)
         .build();
-    let pubs = Buffer::<u32>::builder()
+    let precomp = Buffer::<u32>::builder()
+        .queue(proque.queue().clone())
+        .len(PRECOMP_LIMBS)
+        .build();
+    let points = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
         .len(batch * 16)
-        .build();
-    let addrs = Buffer::<u8>::builder()
-        .queue(proque.queue().clone())
-        .len(batch * 20)
         .build();
     let out_found = Buffer::<i32>::builder()
         .queue(proque.queue().clone())
@@ -516,33 +554,36 @@ pub fn run_gpu(
         .queue(proque.queue().clone())
         .len(params_len(pattern))
         .build();
-    let (base_buf, pubs, addrs, out_found, out_priv, out_addr, params) =
-        match (base_buf, pubs, addrs, out_found, out_priv, out_addr, params) {
-            (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e), Ok(f), Ok(g)) => (a, b, c, d, e, f, g),
-            _ => return Vec::new(),
-        };
+    let (base_buf, precomp, points, out_found, out_priv, out_addr, params) = match (
+        base_buf, precomp, points, out_found, out_priv, out_addr, params,
+    ) {
+        (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e), Ok(f), Ok(g)) => (a, b, c, d, e, f, g),
+        _ => return Vec::new(),
+    };
+
+    // Upload the precomputed table once.
+    let precomp_data = build_precomp();
+    if precomp.write(&precomp_data[..]).enq().is_err() {
+        return Vec::new();
+    }
 
     let derive = proque
-        .kernel_builder("derive_pubkeys")
+        .kernel_builder("derive_points")
         .arg(&base_buf)
-        .arg(&pubs)
-        .build();
-    let hash = proque
-        .kernel_builder("hash_addrs")
-        .arg(&pubs)
-        .arg(&addrs)
+        .arg(&precomp)
+        .arg(&points)
         .build();
     let matcher = proque
-        .kernel_builder("match_addrs")
+        .kernel_builder("hash_match")
         .arg(&base_buf)
-        .arg(&addrs)
+        .arg(&points)
         .arg(&out_found)
         .arg(&out_priv)
         .arg(&out_addr)
         .arg(&params)
         .build();
-    let (derive, hash, matcher) = match (derive, hash, matcher) {
-        (Ok(d), Ok(h), Ok(m)) => (d, h, m),
+    let (derive, matcher) = match (derive, matcher) {
+        (Ok(d), Ok(m)) => (d, m),
         _ => return Vec::new(),
     };
 
@@ -552,7 +593,7 @@ pub fn run_gpu(
     let mut found_groups: HashSet<usize> = HashSet::new();
     if let Some(path) = resume_state {
         if let Some(st) = load_resume_state(path) {
-            base = bytes_to_u32x8(&st.base);
+            base = bytes_to_u32x8_le(&st.base);
             total = st.total;
             found_groups = st.found_groups.iter().cloned().collect();
             eprintln!(
@@ -563,13 +604,13 @@ pub fn run_gpu(
         } else {
             let mut base_bytes = [0u8; 32];
             OsRng.fill_bytes(&mut base_bytes);
-            base = bytes_to_u32x8(&base_bytes);
+            base = bytes_to_u32x8_le(&base_bytes);
             total = 0;
         }
     } else {
         let mut base_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut base_bytes);
-        base = bytes_to_u32x8(&base_bytes);
+        base = bytes_to_u32x8_le(&base_bytes);
         total = 0;
     }
 
@@ -636,21 +677,6 @@ pub fn run_gpu(
         }
         if iter_ok {
             unsafe {
-                if hash
-                    .cmd()
-                    .global_work_size(SpatialDims::One(batch))
-                    .enq()
-                    .is_err()
-                {
-                    iter_ok = false;
-                }
-            }
-        }
-        if iter_ok && proque.queue().finish().is_err() {
-            iter_ok = false;
-        }
-        if iter_ok {
-            unsafe {
                 if matcher
                     .cmd()
                     .global_work_size(SpatialDims::One(batch))
@@ -701,7 +727,7 @@ pub fn run_gpu(
             out_addr.read(&mut addr[..]).enq().ok();
             proque.queue().finish().ok();
 
-            let mut key_bytes = u32x8_to_bytes(&priv_u32);
+            let mut key_bytes = u32x8_le_to_bytes(&priv_u32);
             match privkey_to_address(&key_bytes) {
                 Some(cpu_addr) if cpu_addr == addr => {
                     let reduced = reduce_mod_n(&key_bytes);
@@ -768,7 +794,7 @@ pub fn run_gpu(
         total += batch as u64;
         if let Some(path) = resume_state {
             // Persist progress for crash-safe resume.
-            let base_bytes = u32x8_to_bytes(&base);
+            let base_bytes = u32x8_le_to_bytes(&base);
             let st = ResumeState {
                 base: base_bytes,
                 total,
@@ -806,9 +832,7 @@ pub fn run_gpu(
             }
         }
 
-        let mut bb = u32x8_to_bytes(&base);
-        add_u64_be(&mut bb, batch as u64);
-        base = bytes_to_u32x8(&bb);
+        add_u64_le(&mut base, batch as u64);
     }
     if let Some(cb) = &cb {
         let elapsed = start.elapsed().as_secs_f64();
@@ -841,14 +865,14 @@ pub fn self_test(selection: DeviceSelection) -> bool {
         .len(8)
         .build()
         .unwrap();
-    let pubs = Buffer::<u32>::builder()
+    let precomp = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
-        .len(16)
+        .len(PRECOMP_LIMBS)
         .build()
         .unwrap();
-    let addrs = Buffer::<u8>::builder()
+    let points = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
-        .len(20)
+        .len(16)
         .build()
         .unwrap();
     let out_found = Buffer::<i32>::builder()
@@ -875,22 +899,22 @@ pub fn self_test(selection: DeviceSelection) -> bool {
         .build()
         .unwrap();
 
+    // Upload the precomputed table once (Montgomery form, little-endian).
+    let precomp_data = build_precomp();
+    precomp.write(&precomp_data[..]).enq().unwrap();
+    proque.queue().finish().unwrap();
+
     let derive = proque
-        .kernel_builder("derive_pubkeys")
+        .kernel_builder("derive_points")
         .arg(&base_buf)
-        .arg(&pubs)
-        .build()
-        .unwrap();
-    let hash = proque
-        .kernel_builder("hash_addrs")
-        .arg(&pubs)
-        .arg(&addrs)
+        .arg(&precomp)
+        .arg(&points)
         .build()
         .unwrap();
     let matcher = proque
-        .kernel_builder("match_addrs")
+        .kernel_builder("hash_match")
         .arg(&base_buf)
-        .arg(&addrs)
+        .arg(&points)
         .arg(&out_found)
         .arg(&out_priv)
         .arg(&out_addr)
@@ -903,7 +927,7 @@ pub fn self_test(selection: DeviceSelection) -> bool {
     for t in 0..trials {
         let mut base_bytes = [0u8; 32];
         rng.fill_bytes(&mut base_bytes);
-        let base = bytes_to_u32x8(&base_bytes);
+        let base = bytes_to_u32x8_le(&base_bytes);
 
         let cpu_addr = match privkey_to_address(&base_bytes) {
             Some(a) => a,
@@ -932,13 +956,6 @@ pub fn self_test(selection: DeviceSelection) -> bool {
         unsafe {
             derive
                 .cmd()
-                .global_work_size(SpatialDims::One(1))
-                .enq()
-                .unwrap();
-        }
-        proque.queue().finish().unwrap();
-        unsafe {
-            hash.cmd()
                 .global_work_size(SpatialDims::One(1))
                 .enq()
                 .unwrap();
@@ -974,7 +991,7 @@ pub fn self_test(selection: DeviceSelection) -> bool {
             eprintln!("[self-test] trial {}: GPU address != CPU address", t);
             return false;
         }
-        let key_bytes = u32x8_to_bytes(&priv_u32);
+        let key_bytes = u32x8_le_to_bytes(&priv_u32);
         match privkey_to_address(&key_bytes) {
             Some(a) if a == addr => {}
             _ => {
@@ -986,198 +1003,6 @@ pub fn self_test(selection: DeviceSelection) -> bool {
             }
         }
         eprintln!("[self-test] trial {}: OK", t);
-    }
-    true
-}
-
-/// EXPERIMENTAL: Radeon-friendly scalar multiplication driven by the host.
-///
-/// This is the workaround for the Apple OpenCL 1.2 / AMD Radeon
-/// `cvms_element_build_from_source` crash: instead of a single kernel that
-/// unrolls 256 double-and-add iterations (which the Radeon compiler chokes
-/// on), the host issues 256 dispatches of `radeon_step_bit` (one bit per
-/// dispatch, no loop inside the kernel), keeping the running Jacobian point in
-/// a global scratch buffer. It is mathematically identical to `scalar_mul()`.
-///
-/// GATED: this path is never taken by `run_gpu` / `self_test` unless the
-/// caller explicitly opts in via [`radeon_self_test`] or a future `--radeon`
-/// flag. The kernels themselves are always compiled (they build on every
-/// driver), but the multi-dispatch loop is only exercised when requested, so
-/// the default release path stays on the trusted, well-tested Jacobian kernel.
-///
-/// Returns the affine (Qx, Qy) for `key` (big-endian u32 chunks) on the device.
-/// Panics are avoided: on any OpenCL error the function returns `None`.
-pub fn radeon_scalar_mul(
-    proque: &ProQue,
-    key: &[u32; 8],
-    work_size: usize,
-) -> Option<([u32; 8], [u32; 8])> {
-    // Scratch: 24 uints per work-item (RX,RY,RZ), 16 uints for affine output.
-    let scratch = Buffer::<u32>::builder()
-        .queue(proque.queue().clone())
-        .len(work_size * 24)
-        .build()
-        .ok()?;
-    let base_buf = Buffer::<u32>::builder()
-        .queue(proque.queue().clone())
-        .len(8)
-        .build()
-        .ok()?;
-    // 1-element buffer carrying the current bit index (host overwrites it each
-    // dispatch — see kernel note on why this is a buffer, not a scalar arg).
-    let bit_buf = Buffer::<i32>::builder()
-        .queue(proque.queue().clone())
-        .len(1)
-        .build()
-        .ok()?;
-
-    let init = proque
-        .kernel_builder("radeon_init_inf")
-        .arg(&scratch)
-        .build()
-        .ok()?;
-    let step = proque
-        .kernel_builder("radeon_step_bit")
-        .arg(&scratch)
-        .arg(&base_buf)
-        .arg(&bit_buf)
-        .build()
-        .ok()?;
-    let finalize = proque
-        .kernel_builder("radeon_finalize_affine")
-        .arg(&scratch)
-        .build()
-        .ok()?;
-
-    // Set the base key for every work-item (gid is added inside the kernel for
-    // multi-work-item use; for a single key work_size=1 and gid=0).
-    base_buf.write(&key[..]).enq().ok()?;
-    proque.queue().finish().ok()?;
-
-    unsafe {
-        init.cmd()
-            .global_work_size(SpatialDims::One(work_size))
-            .enq()
-            .ok()?;
-    }
-    proque.queue().finish().ok()?;
-
-    for bit in 0..256i32 {
-        let b: [i32; 1] = [bit];
-        bit_buf.write(&b[..]).enq().ok()?;
-        proque.queue().finish().ok()?;
-        unsafe {
-            step.cmd()
-                .global_work_size(SpatialDims::One(work_size))
-                .enq()
-                .ok()?;
-        }
-        proque.queue().finish().ok()?;
-    }
-
-    unsafe {
-        finalize
-            .cmd()
-            .global_work_size(SpatialDims::One(work_size))
-            .enq()
-            .ok()?;
-    }
-    proque.queue().finish().ok()?;
-
-    // Read back affine (Qx,Qy) for work-item 0.
-    let mut out = vec![0u32; work_size * 16];
-    scratch.read(&mut out[..]).enq().ok()?;
-    proque.queue().finish().ok()?;
-
-    let mut qx = [0u32; 8];
-    let mut qy = [0u32; 8];
-    qx.copy_from_slice(&out[..8]);
-    qy.copy_from_slice(&out[8..16]);
-    Some((qx, qy))
-}
-
-/// EXPERIMENTAL self-test for the Radeon multi-dispatch path.
-///
-/// Validates `radeon_scalar_mul` against the CPU reference
-/// (`privkey_to_address`) for a set of test vectors, including the generator
-/// (key=1), small scalars (key=2,3) and random keys. Returns true only if the
-/// device builds the kernels and every vector matches. This is gated and only
-/// invoked when the user explicitly requests the Radeon experiment.
-pub fn radeon_self_test(selection: DeviceSelection) -> bool {
-    let (proque, dev) = match select_device(selection) {
-        Some(x) => x,
-        None => {
-            eprintln!("[radeon-self-test] no reliable OpenCL device available");
-            return false;
-        }
-    };
-    eprintln!("[radeon-self-test] device: {}", device_name(&dev));
-
-    let mut rng = OsRng;
-    // Test vectors: key=1 (generator), key=2, key=3, then random keys.
-    let mut vectors: Vec<[u8; 32]> = vec![
-        {
-            let mut b = [0u8; 32];
-            b[31] = 1;
-            b
-        },
-        {
-            let mut b = [0u8; 32];
-            b[31] = 2;
-            b
-        },
-        {
-            let mut b = [0u8; 32];
-            b[31] = 3;
-            b
-        },
-    ];
-    for _ in 0..5 {
-        let mut b = [0u8; 32];
-        rng.fill_bytes(&mut b);
-        vectors.push(b);
-    }
-
-    for (i, bytes) in vectors.iter().enumerate() {
-        let key = bytes_to_u32x8(bytes);
-        let expected = match privkey_to_address(bytes) {
-            Some(a) => a,
-            None => {
-                eprintln!("[radeon-self-test] vector {}: CPU reference failed", i);
-                return false;
-            }
-        };
-        let (qx, qy) = match radeon_scalar_mul(&proque, &key, 1) {
-            Some(v) => v,
-            None => {
-                eprintln!(
-                    "[radeon-self-test] vector {}: OpenCL error during dispatch",
-                    i
-                );
-                return false;
-            }
-        };
-        // Reconstruct the address from (Qx, Qy) on the host using the same
-        // keccak path the CPU oracle uses.
-        let mut pub65 = [0u8; 65];
-        pub65[0] = 0x04;
-        for j in 0..8 {
-            let b = qx[j].to_be_bytes();
-            pub65[1 + 2 * j] = b[0];
-            pub65[2 + 2 * j] = b[1];
-            let b = qy[j].to_be_bytes();
-            pub65[17 + 2 * j] = b[0];
-            pub65[18 + 2 * j] = b[1];
-        }
-        let got = crate::crypto::pubkey_to_address(&pub65);
-        if got != expected {
-            eprintln!(
-                "[radeon-self-test] vector {}: MISMATCH (GPU affine != CPU address)",
-                i
-            );
-            return false;
-        }
-        eprintln!("[radeon-self-test] vector {}: OK", i);
     }
     true
 }
@@ -1197,14 +1022,14 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
         .len(8)
         .build()
         .ok()?;
-    let pubs = Buffer::<u32>::builder()
+    let precomp = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
-        .len(batch * 16)
+        .len(PRECOMP_LIMBS)
         .build()
         .ok()?;
-    let addrs = Buffer::<u8>::builder()
+    let points = Buffer::<u32>::builder()
         .queue(proque.queue().clone())
-        .len(batch * 20)
+        .len(batch * 16)
         .build()
         .ok()?;
     let out_found = Buffer::<i32>::builder()
@@ -1228,22 +1053,20 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
         .build()
         .ok()?;
 
+    precomp.write(&build_precomp()[..]).enq().ok()?;
+    proque.queue().finish().ok()?;
+
     let derive = proque
-        .kernel_builder("derive_pubkeys")
+        .kernel_builder("derive_points")
         .arg(&base_buf)
-        .arg(&pubs)
-        .build()
-        .ok()?;
-    let hash = proque
-        .kernel_builder("hash_addrs")
-        .arg(&pubs)
-        .arg(&addrs)
+        .arg(&precomp)
+        .arg(&points)
         .build()
         .ok()?;
     let matcher = proque
-        .kernel_builder("match_addrs")
+        .kernel_builder("hash_match")
         .arg(&base_buf)
-        .arg(&addrs)
+        .arg(&points)
         .arg(&out_found)
         .arg(&out_priv)
         .arg(&out_addr)
@@ -1253,7 +1076,7 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
 
     let mut base_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut base_bytes);
-    let mut base = bytes_to_u32x8(&base_bytes);
+    let mut base = bytes_to_u32x8_le(&base_bytes);
 
     params.write(&make_params(&base, &pat)).enq().ok()?;
 
@@ -1277,13 +1100,6 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
         }
         proque.queue().finish().ok()?;
         unsafe {
-            hash.cmd()
-                .global_work_size(SpatialDims::One(batch))
-                .enq()
-                .ok()?;
-        }
-        proque.queue().finish().ok()?;
-        unsafe {
             matcher
                 .cmd()
                 .global_work_size(SpatialDims::One(batch))
@@ -1292,9 +1108,7 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
         }
         proque.queue().finish().ok()?;
         total += batch as u64;
-        let mut bb = u32x8_to_bytes(&base);
-        add_u64_be(&mut bb, batch as u64);
-        base = bytes_to_u32x8(&bb);
+        add_u64_le(&mut base, batch as u64);
     }
     let elapsed = start.elapsed().as_secs_f64().max(1e-6);
     let rate = total as f64 / elapsed;
@@ -1307,102 +1121,4 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
         rate / 1e6
     );
     Some(rate)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::crypto::pubkey_to_address;
-
-    /// Helper: re-derive the EVM address from a device-side affine point.
-    fn affine_to_address(qx: &[u32; 8], qy: &[u32; 8]) -> [u8; 20] {
-        let mut pub65 = [0u8; 65];
-        pub65[0] = 0x04;
-        for j in 0..8 {
-            let b = qx[j].to_be_bytes();
-            pub65[1 + 2 * j] = b[0];
-            pub65[2 + 2 * j] = b[1];
-            let b = qy[j].to_be_bytes();
-            pub65[17 + 2 * j] = b[0];
-            pub65[18 + 2 * j] = b[1];
-        }
-        pubkey_to_address(&pub65)
-    }
-
-    /// Build a ProQue on the first available GPU; skip the test if none.
-    fn first_gpu_proque() -> Option<ProQue> {
-        for p in Platform::list() {
-            if let Ok(devs) = Device::list(p, Some(DeviceType::GPU)) {
-                for d in devs {
-                    if let Some(proque) = build_proque(p, d) {
-                        if probe_device(&proque) {
-                            return Some(proque);
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    #[test]
-    #[ignore = "requires a real OpenCL GPU (CI runners have none); run with `cargo test -- --ignored`"]
-    fn radeon_scalar_mul_matches_cpu() {
-        let proque = match first_gpu_proque() {
-            Some(p) => p,
-            None => {
-                eprintln!("[test] no reliable GPU — skipping radeon_scalar_mul test");
-                return;
-            }
-        };
-
-        let cases: Vec<[u8; 32]> = vec![
-            {
-                let mut b = [0u8; 32];
-                b[31] = 1; // generator
-                b
-            },
-            {
-                let mut b = [0u8; 32];
-                b[31] = 2;
-                b
-            },
-            {
-                let mut b = [0u8; 32];
-                b[31] = 3;
-                b
-            },
-            [0x12; 32],
-            [0xAB; 32],
-        ];
-
-        for bytes in &cases {
-            let key = bytes_to_u32x8(bytes);
-            let expected = privkey_to_address(bytes).expect("CPU reference");
-            let (qx, qy) = radeon_scalar_mul(&proque, &key, 1).expect("radeon_scalar_mul dispatch");
-            let got = affine_to_address(&qx, &qy);
-            assert_eq!(
-                got, expected,
-                "radeon_scalar_mul mismatch for key {:?}",
-                bytes
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a real OpenCL GPU (CI runners have none); run with `cargo test -- --ignored`"]
-    fn radeon_self_test_runs() {
-        // This exercises the full gated path; it only asserts the function
-        // returns a bool (true on a working device, false otherwise) without
-        // panicking. On a machine without a reliable GPU it returns false.
-        let result = radeon_self_test(DeviceSelection::Auto);
-        if result {
-            eprintln!("[radeon] self-test OK on this host");
-        } else {
-            // CI runners and most Linux dev boxes have no reliable GPU; this
-            // test asserts the dispatch path is reachable and panic-free, not
-            // that the host must own a working AMD discrete GPU. Skip cleanly.
-            eprintln!("[radeon] skipped: no reliable GPU on this host");
-        }
-    }
 }

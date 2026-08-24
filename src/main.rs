@@ -78,21 +78,6 @@ struct Cli {
     #[arg(long)]
     self_test: bool,
 
-    /// EXPERIMENTAL: validate the Radeon multi-dispatch kernel
-    /// (radeon_init_inf/radeon_step_bit/radeon_finalize_affine) against the CPU
-    /// reference, then exit.
-    ///
-    /// **macOS-only workaround**: the Apple OpenCL 1.2 compiler (used on Intel
-    /// Macs with discrete AMD GPUs such as the Radeon Pro 560X) crashes inside
-    /// `cvms_element_build_from_source` when compiling the default single-pass
-    /// `scalar_mul()` kernel. This multi-dispatch path sidesteps that crash
-    /// by moving the 256-iteration double-and-add loop into the host. It is
-    /// slower than the default Jacobian kernel and only useful on macOS.
-    /// On Windows (AMD/NVIDIA/Intel Adrenalin or vendor OpenCL ICD) the
-    /// default Jacobian path compiles and runs fine — do not use this flag.
-    #[arg(long)]
-    radeon_self_test: bool,
-
     /// GPU device selection: "auto" (default, prefer discrete), "list" to show
     /// available GPUs, or an index / name substring (e.g. "1", "Radeon").
     #[arg(long, default_value = "auto")]
@@ -177,21 +162,6 @@ fn main() {
             return;
         } else {
             eprintln!("[self-test] FAIL — do not trust GPU results on this device.");
-            std::process::exit(1);
-        }
-    }
-
-    if cli.radeon_self_test {
-        eprintln!(
-            "[radeon-self-test] validating EXPERIMENTAL Radeon multi-dispatch kernel \
-             against CPU reference..."
-        );
-        let ok = gpu::radeon_self_test(device);
-        if ok {
-            println!("[radeon-self-test] PASS — Radeon multi-dispatch kernel matches CPU.");
-            return;
-        } else {
-            eprintln!("[radeon-self-test] FAIL — do not trust this path on this device.");
             std::process::exit(1);
         }
     }

@@ -1,606 +1,272 @@
-// kernel.cl — EVM vanity search (OpenCL)
+// kernel.cl — EVM vanity search (OpenCL, Montgomery form, little-endian)
 //
-// Host-side note: this file is compiled together with a small stdint prelude
-// (see gpu.rs) because Apple's OpenCL 1.2 compiler does not auto-inject
-// <stdint.h>. All fixed-width 64-bit state uses int64_t/uint64_t.
+// Rewritten for speed. The previous kernel used schoolbook multiply + a
+// 40-pass reduction and bit-by-bit double-and-add (256 doubles + 128 adds),
+// plus TWO full modular inverses (~384 multiplies each) per point. That
+// capped throughput at ~1 Mkeys/s. This kernel uses the recipe mature tools
+// use (profanity/VanitySearch):
+//   * Montgomery CIOS multiply (no division, no multi-pass reduction)
+//   * byte-windowed scalar multiplication over a 32x255 precomputed table of
+//     (b * 256^pos) * G affine points — ~16 mixed adds, no double loop
+//   * Jacobian accumulator + a single inversion per point
 //
-// Portability notes — what each kernel needs from the host OpenCL runtime:
-//   * Apple OpenCL 1.2 (Intel UHD 630 / AMD Radeon Pro 560X on macOS):
-//       - The compiler mishandles dynamic indexing into file-scope `constant`
-//         arrays, so keccak_f keeps its round constants as function-local
-//         `const`.
-//       - The 64-bit rotate() builtin is mis-compiled on the Radeon driver,
-//         so we use a manual rotl64() definition.
-//       - Affine scalar multiplication needs one modular inverse per point
-//         operation; on the Intel UHD 630 that exceeds the macOS display-GPU
-//         watchdog for private keys with many 1-bits. We therefore use
-//         Jacobian projective coordinates: doubling and addition need no
-//         inverses, and only the final conversion back to affine performs a
-//         single inverse.
-//       - On the AMD Radeon Pro 560X, the default `scalar_mul()` kernel
-//         crashes the Apple OpenCL compiler inside
-//         `cvms_element_build_from_source`. As a macOS-only workaround the
-//         multi-dispatch kernels radeon_init_inf / radeon_step_bit /
-//         radeon_finalize_affine move the 256 iteration loop into the host.
-//         They are gated by `--radeon-self-test` and are NOT used by the
-//         default search path. Do not enable them on Windows.
-//       - scalar_mul() and keccak256_addr() were historically cross-optimized
-//         incorrectly on Radeon, so we keep a three-pass pipeline connected by
-//         global scratch buffers:
-//           derive_pubkeys : key -> (Qx, Qy)
-//           hash_addrs     : (Qx, Qy) -> EVM address bytes
-//           match_addrs    : address -> prefix/suffix match
-//   * Windows OpenCL (AMD Adrenalin / NVIDIA CUDA / Intel oneAPI):
-//       - The vendor compilers (AMD 25.x, CUDA, Intel) compile this kernel
-//         as-is. Jacobian single-kernel path is the fastest path on Windows
-//         discrete GPUs (e.g. AMD Radeon RX 6000/7000, NVIDIA RTX). No
-//         macOS-only workaround is needed.
-//   * Linux OpenCL (Mesa / ROCm / NVIDIA):
-//       - Same as Windows — the default path is correct and fastest.
+// Every field element is 8 little-endian 32-bit limbs in Montgomery form
+// (a*R mod p). This is a verbatim port of src/mont.rs and src/ec.rs, which
+// are proven correct on the CPU against num-bigint and the secp256k1 crate.
 //
-// The host re-derives every candidate address on the CPU, so a buggy kernel can
-// never emit a mismatched private key/address pair.
+// Kernel pipeline (2 kernels):
+//   derive_points : byte-windowed point-mul + affine conversion -> (x,y) bytes
+//   hash_match    : keccak256(x||y) -> EVM address, prefix/suffix match
 
-#define NL 8
+// ---- field constants (little-endian limbs) --------------------------------
 
 constant uint P[8] = {
-    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
-    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFEu, 0xFFFFFC2Fu
+    0xFFFFFC2Fu, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu
 };
-constant uint GX[8] = {
-    0x79BE667Eu, 0xF9DCBBACu, 0x55A06295u, 0xCE870B07u,
-    0x029BFCDBu, 0x2DCE28D9u, 0x59F2815Bu, 0x16F81798u
-};
-constant uint GY[8] = {
-    0x483ADA77u, 0x26A3C465u, 0x5DA4FBFCu, 0x0E1108A8u,
-    0xFD17B448u, 0xA6855419u, 0x9C47D08Fu, 0xFB10D4B8u
-};
-constant uint PM2[8] = {
-    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
-    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFEu, 0xFFFFFC2Du
-};
+constant uint MPRIME = 0xD2253531u; // -P^-1 mod 2^32
+constant uint R_MONT[8] = { 0x3D1u, 0x1u, 0, 0, 0, 0, 0, 0 }; // R = 2^256 mod p
+constant uint R2_MONT[8] = { 0xE90A1u, 0x7A2u, 0x1u, 0, 0, 0, 0, 0 }; // R^2 = 2^512 mod p
 
-// ---- field helpers -------------------------------------------------------
+// ---- field helpers --------------------------------------------------------
 
-static inline int fe_cmp(const uint* a, const uint* b) {
-    for (int i = 0; i < NL; i++) {
+static inline int fe_ge(const uint* a, const uint* b) {
+    for (int i = 7; i >= 0; i--) {
         if (a[i] > b[i]) return 1;
-        if (a[i] < b[i]) return -1;
+        if (a[i] < b[i]) return 0;
     }
-    return 0;
+    return 1; // equal
 }
-static inline int fe_ge(const uint* a, const uint* b) { return fe_cmp(a, b) >= 0; }
 static inline int fe_is_zero(const uint* a) {
-    for (int i = 0; i < NL; i++) if (a[i]) return 0;
+    for (int i = 0; i < 8; i++) if (a[i]) return 0;
     return 1;
 }
 
-static inline void fe_sub(uint* r, const uint* a, const uint* b) {
+// Montgomery multiply (CIOS): r = a * b * R^-1 mod p.
+// Verbatim port of src/mont.rs::mont_mul (10-limb accumulator).
+static void mont_mul(uint* r, const uint* a, const uint* b) {
+    uint64_t t[10];
+    for (int i = 0; i < 10; i++) t[i] = 0;
+
+    for (int i = 0; i < 8; i++) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 8; j++) {
+            uint64_t v = t[j] + (uint64_t)a[i] * (uint64_t)b[j] + carry;
+            t[j] = v & 0xFFFFFFFFULL;
+            carry = v >> 32;
+        }
+        uint64_t v = t[8] + carry;
+        t[8] = v & 0xFFFFFFFFULL;
+        t[9] = v >> 32;
+
+        uint m = (uint)((t[0] & 0xFFFFFFFFULL) * MPRIME);
+
+        carry = 0;
+        for (int j = 0; j < 8; j++) {
+            v = t[j] + (uint64_t)m * (uint64_t)P[j] + carry;
+            if (j >= 1) t[j - 1] = v & 0xFFFFFFFFULL;
+            carry = v >> 32;
+        }
+        v = t[8] + carry;
+        t[7] = v & 0xFFFFFFFFULL;
+        uint64_t c2 = v >> 32;
+        v = t[9] + c2;
+        t[8] = v & 0xFFFFFFFFULL;
+        t[9] = v >> 32;
+    }
+
+    for (int j = 0; j < 8; j++) r[j] = (uint)t[j];
+    // Final reduction: t[8] is 0 or 1; subtract p once if >= p.
+    if (t[8] > 0 || fe_ge(r, P)) {
+        int64_t borrow = 0;
+        for (int j = 0; j < 8; j++) {
+            int64_t cur = (int64_t)r[j] - (int64_t)P[j] - borrow;
+            if (cur < 0) { r[j] = (uint)(cur + (1LL << 32)); borrow = 1; }
+            else { r[j] = (uint)cur; borrow = 0; }
+        }
+    }
+}
+
+static void mont_sqr(uint* r, const uint* a) { mont_mul(r, a, a); }
+
+// Montgomery addition (a + b) mod p, with a 9th carry limb.
+static void mont_add(uint* r, const uint* a, const uint* b) {
+    uint64_t t[9];
+    uint64_t carry = 0;
+    for (int i = 0; i < 8; i++) {
+        uint64_t v = (uint64_t)a[i] + (uint64_t)b[i] + carry;
+        t[i] = v & 0xFFFFFFFFULL;
+        carry = v >> 32;
+    }
+    t[8] = carry;
+    if (t[8] > 0 || fe_ge((uint*)t, P)) {
+        int64_t borrow = 0;
+        for (int i = 0; i < 8; i++) {
+            int64_t cur = (int64_t)t[i] - (int64_t)P[i] - borrow;
+            if (cur < 0) { t[i] = (uint64_t)(cur + (1LL << 32)); borrow = 1; }
+            else { t[i] = (uint64_t)cur; borrow = 0; }
+        }
+    }
+    for (int i = 0; i < 8; i++) r[i] = (uint)t[i];
+}
+
+// Montgomery subtraction (a - b) mod p.
+static void mont_sub(uint* r, const uint* a, const uint* b) {
     int64_t borrow = 0;
-    for (int i = NL - 1; i >= 0; i--) {
+    for (int i = 0; i < 8; i++) {
         int64_t cur = (int64_t)a[i] - (int64_t)b[i] - borrow;
-        if (cur < 0) { cur += (1LL << 32); borrow = 1; }
-        else borrow = 0;
-        r[i] = (uint)cur;
+        if (cur < 0) { r[i] = (uint)(cur + (1LL << 32)); borrow = 1; }
+        else { r[i] = (uint)cur; borrow = 0; }
+    }
+    if (borrow > 0) {
+        uint64_t carry = 0;
+        for (int i = 0; i < 8; i++) {
+            uint64_t v = (uint64_t)r[i] + (uint64_t)P[i] + carry;
+            r[i] = (uint)(v & 0xFFFFFFFFULL);
+            carry = v >> 32;
+        }
     }
 }
 
-static inline void fe_add_raw(uint* r, const uint* a, const uint* b) {
-    uint64_t c = 0;
-    for (int i = NL - 1; i >= 0; i--) {
-        c = (uint64_t)a[i] + (uint64_t)b[i] + (c >> 32);
-        r[i] = (uint)(c & 0xFFFFFFFFULL);
-    }
+// Montgomery doubling (== mont_add(a, a)).
+static void mont_double(uint* r, const uint* a) { mont_add(r, a, a); }
+
+// Convert canonical -> Montgomery form (multiply by R^2).
+static void to_mont(uint* r, const uint* a) { mont_mul(r, a, R2_MONT); }
+
+// Convert Montgomery -> canonical form (multiply by 1).
+static void from_mont(uint* r, const uint* a) {
+    uint one[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
+    mont_mul(r, a, one);
 }
 
-static inline void fe_sub_mod(uint* r, const uint* a, const uint* b) {
-    uint d[8];
-    int64_t borrow = 0;
-    for (int i = NL - 1; i >= 0; i--) {
-        int64_t cur = (int64_t)a[i] - (int64_t)b[i] - borrow;
-        if (cur < 0) { cur += (1LL << 32); borrow = 1; }
-        else borrow = 0;
-        d[i] = (uint)cur;
-    }
-    if (!borrow) {
-        for (int i = 0; i < NL; i++) r[i] = d[i];
-    } else {
-        uint p[8];
-        for (int i = 0; i < NL; i++) p[i] = P[i];
-        fe_add_raw(r, d, p);
-    }
-}
-
-static inline void fe_add(uint* r, const uint* a, const uint* b) {
-    uint64_t c = 0;
-    for (int i = NL - 1; i >= 0; i--) {
-        c = (uint64_t)a[i] + (uint64_t)b[i] + (c >> 32);
-        r[i] = (uint)(c & 0xFFFFFFFFULL);
-    }
-    uint p[8];
-    for (int i = 0; i < NL; i++) p[i] = P[i];
-    if (c >> 32) { fe_sub(r, r, p); }
-    else if (fe_ge(r, p)) { fe_sub(r, r, p); }
-}
-
-static void fe_reduce_512(uint* r, uint64_t* acc) {
-    // Carry-only reduction. Each pass normalizes the high limbs and folds any
-    // overflow in limbs 0..7 back into limbs 7..15 using 2^256 ≡ 2^32 + 977
-    // (mod P). Written with fully unrolled, constant-index statements (no
-    // loop-variable array indexing) for portability on Apple OpenCL 1.2 / Radeon,
-    // whose compiler mis-compiles dynamic `acc[7+k]`-style indexing.
-    for (int pass = 0; pass < 40; pass++) {
-        // carry normalize (constant indices)
-        acc[14] += acc[15] >> 32; acc[15] &= 0xFFFFFFFFULL;
-        acc[13] += acc[14] >> 32; acc[14] &= 0xFFFFFFFFULL;
-        acc[12] += acc[13] >> 32; acc[13] &= 0xFFFFFFFFULL;
-        acc[11] += acc[12] >> 32; acc[12] &= 0xFFFFFFFFULL;
-        acc[10] += acc[11] >> 32; acc[11] &= 0xFFFFFFFFULL;
-        acc[9]  += acc[10] >> 32; acc[10] &= 0xFFFFFFFFULL;
-        acc[8]  += acc[9]  >> 32; acc[9]  &= 0xFFFFFFFFULL;
-        acc[7]  += acc[8]  >> 32; acc[8]  &= 0xFFFFFFFFULL;
-        acc[6]  += acc[7]  >> 32; acc[7]  &= 0xFFFFFFFFULL;
-        acc[5]  += acc[6]  >> 32; acc[6]  &= 0xFFFFFFFFULL;
-        acc[4]  += acc[5]  >> 32; acc[5]  &= 0xFFFFFFFFULL;
-        acc[3]  += acc[4]  >> 32; acc[4]  &= 0xFFFFFFFFULL;
-        acc[2]  += acc[3]  >> 32; acc[3]  &= 0xFFFFFFFFULL;
-        acc[1]  += acc[2]  >> 32; acc[2]  &= 0xFFFFFFFFULL;
-        acc[0]  += acc[1]  >> 32; acc[1]  &= 0xFFFFFFFFULL;
-
-        uint64_t hv0 = acc[0], hv1 = acc[1], hv2 = acc[2], hv3 = acc[3];
-        uint64_t hv4 = acc[4], hv5 = acc[5], hv6 = acc[6], hv7 = acc[7];
-        uint64_t any = hv0 | hv1 | hv2 | hv3 | hv4 | hv5 | hv6 | hv7;
-        if (!any) break;
-        acc[0] = 0; acc[1] = 0; acc[2] = 0; acc[3] = 0;
-        acc[4] = 0; acc[5] = 0; acc[6] = 0; acc[7] = 0;
-        // fold high 256 bits back: acc[7+k] += hv[k]; acc[8+k] += hv[k]*977
-        acc[7]  += hv0;          acc[8]  += hv0 * 977ULL;
-        acc[8]  += hv1;          acc[9]  += hv1 * 977ULL;
-        acc[9]  += hv2;          acc[10] += hv2 * 977ULL;
-        acc[10] += hv3;          acc[11] += hv3 * 977ULL;
-        acc[11] += hv4;          acc[12] += hv4 * 977ULL;
-        acc[12] += hv5;          acc[13] += hv5 * 977ULL;
-        acc[13] += hv6;          acc[14] += hv6 * 977ULL;
-        acc[14] += hv7;          acc[15] += hv7 * 977ULL;
-    }
-    uint rr[8];
-    for (int i = 0; i < 8; i++) rr[i] = (uint)acc[8 + i];
-    uint p[8];
-    for (int i = 0; i < NL; i++) p[i] = P[i];
-    while (fe_ge(rr, p)) fe_sub(rr, rr, p);
-    for (int i = 0; i < NL; i++) r[i] = rr[i];
-}
-
-static void fe_mul(uint* r, const uint* a, const uint* b) {
-    uint64_t acc[16];
-    for (int i = 0; i < 16; i++) acc[i] = 0;
-    // Fully unrolled 8x8 schoolbook multiply. Constant indices only — no
-    // loop-variable array indexing — for Apple OpenCL 1.2 / Radeon portability.
-    // a[i]*b[j] contributes to acc[i+j] (high 32 bits) and acc[i+j+1] (low 32 bits).
-    // i=0
-    acc[0]  += ((uint64_t)a[0] * (uint64_t)b[0]) >> 32;  acc[1]  += ((uint64_t)a[0] * (uint64_t)b[0]) & 0xFFFFFFFFULL;
-    acc[1]  += ((uint64_t)a[0] * (uint64_t)b[1]) >> 32;  acc[2]  += ((uint64_t)a[0] * (uint64_t)b[1]) & 0xFFFFFFFFULL;
-    acc[2]  += ((uint64_t)a[0] * (uint64_t)b[2]) >> 32;  acc[3]  += ((uint64_t)a[0] * (uint64_t)b[2]) & 0xFFFFFFFFULL;
-    acc[3]  += ((uint64_t)a[0] * (uint64_t)b[3]) >> 32;  acc[4]  += ((uint64_t)a[0] * (uint64_t)b[3]) & 0xFFFFFFFFULL;
-    acc[4]  += ((uint64_t)a[0] * (uint64_t)b[4]) >> 32;  acc[5]  += ((uint64_t)a[0] * (uint64_t)b[4]) & 0xFFFFFFFFULL;
-    acc[5]  += ((uint64_t)a[0] * (uint64_t)b[5]) >> 32;  acc[6]  += ((uint64_t)a[0] * (uint64_t)b[5]) & 0xFFFFFFFFULL;
-    acc[6]  += ((uint64_t)a[0] * (uint64_t)b[6]) >> 32;  acc[7]  += ((uint64_t)a[0] * (uint64_t)b[6]) & 0xFFFFFFFFULL;
-    acc[7]  += ((uint64_t)a[0] * (uint64_t)b[7]) >> 32;  acc[8]  += ((uint64_t)a[0] * (uint64_t)b[7]) & 0xFFFFFFFFULL;
-    // i=1
-    acc[1]  += ((uint64_t)a[1] * (uint64_t)b[0]) >> 32;  acc[2]  += ((uint64_t)a[1] * (uint64_t)b[0]) & 0xFFFFFFFFULL;
-    acc[2]  += ((uint64_t)a[1] * (uint64_t)b[1]) >> 32;  acc[3]  += ((uint64_t)a[1] * (uint64_t)b[1]) & 0xFFFFFFFFULL;
-    acc[3]  += ((uint64_t)a[1] * (uint64_t)b[2]) >> 32;  acc[4]  += ((uint64_t)a[1] * (uint64_t)b[2]) & 0xFFFFFFFFULL;
-    acc[4]  += ((uint64_t)a[1] * (uint64_t)b[3]) >> 32;  acc[5]  += ((uint64_t)a[1] * (uint64_t)b[3]) & 0xFFFFFFFFULL;
-    acc[5]  += ((uint64_t)a[1] * (uint64_t)b[4]) >> 32;  acc[6]  += ((uint64_t)a[1] * (uint64_t)b[4]) & 0xFFFFFFFFULL;
-    acc[6]  += ((uint64_t)a[1] * (uint64_t)b[5]) >> 32;  acc[7]  += ((uint64_t)a[1] * (uint64_t)b[5]) & 0xFFFFFFFFULL;
-    acc[7]  += ((uint64_t)a[1] * (uint64_t)b[6]) >> 32;  acc[8]  += ((uint64_t)a[1] * (uint64_t)b[6]) & 0xFFFFFFFFULL;
-    acc[8]  += ((uint64_t)a[1] * (uint64_t)b[7]) >> 32;  acc[9]  += ((uint64_t)a[1] * (uint64_t)b[7]) & 0xFFFFFFFFULL;
-    // i=2
-    acc[2]  += ((uint64_t)a[2] * (uint64_t)b[0]) >> 32;  acc[3]  += ((uint64_t)a[2] * (uint64_t)b[0]) & 0xFFFFFFFFULL;
-    acc[3]  += ((uint64_t)a[2] * (uint64_t)b[1]) >> 32;  acc[4]  += ((uint64_t)a[2] * (uint64_t)b[1]) & 0xFFFFFFFFULL;
-    acc[4]  += ((uint64_t)a[2] * (uint64_t)b[2]) >> 32;  acc[5]  += ((uint64_t)a[2] * (uint64_t)b[2]) & 0xFFFFFFFFULL;
-    acc[5]  += ((uint64_t)a[2] * (uint64_t)b[3]) >> 32;  acc[6]  += ((uint64_t)a[2] * (uint64_t)b[3]) & 0xFFFFFFFFULL;
-    acc[6]  += ((uint64_t)a[2] * (uint64_t)b[4]) >> 32;  acc[7]  += ((uint64_t)a[2] * (uint64_t)b[4]) & 0xFFFFFFFFULL;
-    acc[7]  += ((uint64_t)a[2] * (uint64_t)b[5]) >> 32;  acc[8]  += ((uint64_t)a[2] * (uint64_t)b[5]) & 0xFFFFFFFFULL;
-    acc[8]  += ((uint64_t)a[2] * (uint64_t)b[6]) >> 32;  acc[9]  += ((uint64_t)a[2] * (uint64_t)b[6]) & 0xFFFFFFFFULL;
-    acc[9]  += ((uint64_t)a[2] * (uint64_t)b[7]) >> 32;  acc[10] += ((uint64_t)a[2] * (uint64_t)b[7]) & 0xFFFFFFFFULL;
-    // i=3
-    acc[3]  += ((uint64_t)a[3] * (uint64_t)b[0]) >> 32;  acc[4]  += ((uint64_t)a[3] * (uint64_t)b[0]) & 0xFFFFFFFFULL;
-    acc[4]  += ((uint64_t)a[3] * (uint64_t)b[1]) >> 32;  acc[5]  += ((uint64_t)a[3] * (uint64_t)b[1]) & 0xFFFFFFFFULL;
-    acc[5]  += ((uint64_t)a[3] * (uint64_t)b[2]) >> 32;  acc[6]  += ((uint64_t)a[3] * (uint64_t)b[2]) & 0xFFFFFFFFULL;
-    acc[6]  += ((uint64_t)a[3] * (uint64_t)b[3]) >> 32;  acc[7]  += ((uint64_t)a[3] * (uint64_t)b[3]) & 0xFFFFFFFFULL;
-    acc[7]  += ((uint64_t)a[3] * (uint64_t)b[4]) >> 32;  acc[8]  += ((uint64_t)a[3] * (uint64_t)b[4]) & 0xFFFFFFFFULL;
-    acc[8]  += ((uint64_t)a[3] * (uint64_t)b[5]) >> 32;  acc[9]  += ((uint64_t)a[3] * (uint64_t)b[5]) & 0xFFFFFFFFULL;
-    acc[9]  += ((uint64_t)a[3] * (uint64_t)b[6]) >> 32;  acc[10] += ((uint64_t)a[3] * (uint64_t)b[6]) & 0xFFFFFFFFULL;
-    acc[10] += ((uint64_t)a[3] * (uint64_t)b[7]) >> 32;  acc[11] += ((uint64_t)a[3] * (uint64_t)b[7]) & 0xFFFFFFFFULL;
-    // i=4
-    acc[4]  += ((uint64_t)a[4] * (uint64_t)b[0]) >> 32;  acc[5]  += ((uint64_t)a[4] * (uint64_t)b[0]) & 0xFFFFFFFFULL;
-    acc[5]  += ((uint64_t)a[4] * (uint64_t)b[1]) >> 32;  acc[6]  += ((uint64_t)a[4] * (uint64_t)b[1]) & 0xFFFFFFFFULL;
-    acc[6]  += ((uint64_t)a[4] * (uint64_t)b[2]) >> 32;  acc[7]  += ((uint64_t)a[4] * (uint64_t)b[2]) & 0xFFFFFFFFULL;
-    acc[7]  += ((uint64_t)a[4] * (uint64_t)b[3]) >> 32;  acc[8]  += ((uint64_t)a[4] * (uint64_t)b[3]) & 0xFFFFFFFFULL;
-    acc[8]  += ((uint64_t)a[4] * (uint64_t)b[4]) >> 32;  acc[9]  += ((uint64_t)a[4] * (uint64_t)b[4]) & 0xFFFFFFFFULL;
-    acc[9]  += ((uint64_t)a[4] * (uint64_t)b[5]) >> 32;  acc[10] += ((uint64_t)a[4] * (uint64_t)b[5]) & 0xFFFFFFFFULL;
-    acc[10] += ((uint64_t)a[4] * (uint64_t)b[6]) >> 32;  acc[11] += ((uint64_t)a[4] * (uint64_t)b[6]) & 0xFFFFFFFFULL;
-    acc[11] += ((uint64_t)a[4] * (uint64_t)b[7]) >> 32;  acc[12] += ((uint64_t)a[4] * (uint64_t)b[7]) & 0xFFFFFFFFULL;
-    // i=5
-    acc[5]  += ((uint64_t)a[5] * (uint64_t)b[0]) >> 32;  acc[6]  += ((uint64_t)a[5] * (uint64_t)b[0]) & 0xFFFFFFFFULL;
-    acc[6]  += ((uint64_t)a[5] * (uint64_t)b[1]) >> 32;  acc[7]  += ((uint64_t)a[5] * (uint64_t)b[1]) & 0xFFFFFFFFULL;
-    acc[7]  += ((uint64_t)a[5] * (uint64_t)b[2]) >> 32;  acc[8]  += ((uint64_t)a[5] * (uint64_t)b[2]) & 0xFFFFFFFFULL;
-    acc[8]  += ((uint64_t)a[5] * (uint64_t)b[3]) >> 32;  acc[9]  += ((uint64_t)a[5] * (uint64_t)b[3]) & 0xFFFFFFFFULL;
-    acc[9]  += ((uint64_t)a[5] * (uint64_t)b[4]) >> 32;  acc[10] += ((uint64_t)a[5] * (uint64_t)b[4]) & 0xFFFFFFFFULL;
-    acc[10] += ((uint64_t)a[5] * (uint64_t)b[5]) >> 32;  acc[11] += ((uint64_t)a[5] * (uint64_t)b[5]) & 0xFFFFFFFFULL;
-    acc[11] += ((uint64_t)a[5] * (uint64_t)b[6]) >> 32;  acc[12] += ((uint64_t)a[5] * (uint64_t)b[6]) & 0xFFFFFFFFULL;
-    acc[12] += ((uint64_t)a[5] * (uint64_t)b[7]) >> 32;  acc[13] += ((uint64_t)a[5] * (uint64_t)b[7]) & 0xFFFFFFFFULL;
-    // i=6
-    acc[6]  += ((uint64_t)a[6] * (uint64_t)b[0]) >> 32;  acc[7]  += ((uint64_t)a[6] * (uint64_t)b[0]) & 0xFFFFFFFFULL;
-    acc[7]  += ((uint64_t)a[6] * (uint64_t)b[1]) >> 32;  acc[8]  += ((uint64_t)a[6] * (uint64_t)b[1]) & 0xFFFFFFFFULL;
-    acc[8]  += ((uint64_t)a[6] * (uint64_t)b[2]) >> 32;  acc[9]  += ((uint64_t)a[6] * (uint64_t)b[2]) & 0xFFFFFFFFULL;
-    acc[9]  += ((uint64_t)a[6] * (uint64_t)b[3]) >> 32;  acc[10] += ((uint64_t)a[6] * (uint64_t)b[3]) & 0xFFFFFFFFULL;
-    acc[10] += ((uint64_t)a[6] * (uint64_t)b[4]) >> 32;  acc[11] += ((uint64_t)a[6] * (uint64_t)b[4]) & 0xFFFFFFFFULL;
-    acc[11] += ((uint64_t)a[6] * (uint64_t)b[5]) >> 32;  acc[12] += ((uint64_t)a[6] * (uint64_t)b[5]) & 0xFFFFFFFFULL;
-    acc[12] += ((uint64_t)a[6] * (uint64_t)b[6]) >> 32;  acc[13] += ((uint64_t)a[6] * (uint64_t)b[6]) & 0xFFFFFFFFULL;
-    acc[13] += ((uint64_t)a[6] * (uint64_t)b[7]) >> 32;  acc[14] += ((uint64_t)a[6] * (uint64_t)b[7]) & 0xFFFFFFFFULL;
-    // i=7
-    acc[7]  += ((uint64_t)a[7] * (uint64_t)b[0]) >> 32;  acc[8]  += ((uint64_t)a[7] * (uint64_t)b[0]) & 0xFFFFFFFFULL;
-    acc[8]  += ((uint64_t)a[7] * (uint64_t)b[1]) >> 32;  acc[9]  += ((uint64_t)a[7] * (uint64_t)b[1]) & 0xFFFFFFFFULL;
-    acc[9]  += ((uint64_t)a[7] * (uint64_t)b[2]) >> 32;  acc[10] += ((uint64_t)a[7] * (uint64_t)b[2]) & 0xFFFFFFFFULL;
-    acc[10] += ((uint64_t)a[7] * (uint64_t)b[3]) >> 32;  acc[11] += ((uint64_t)a[7] * (uint64_t)b[3]) & 0xFFFFFFFFULL;
-    acc[11] += ((uint64_t)a[7] * (uint64_t)b[4]) >> 32;  acc[12] += ((uint64_t)a[7] * (uint64_t)b[4]) & 0xFFFFFFFFULL;
-    acc[12] += ((uint64_t)a[7] * (uint64_t)b[5]) >> 32;  acc[13] += ((uint64_t)a[7] * (uint64_t)b[5]) & 0xFFFFFFFFULL;
-    acc[13] += ((uint64_t)a[7] * (uint64_t)b[6]) >> 32;  acc[14] += ((uint64_t)a[7] * (uint64_t)b[6]) & 0xFFFFFFFFULL;
-    acc[14] += ((uint64_t)a[7] * (uint64_t)b[7]) >> 32;  acc[15] += ((uint64_t)a[7] * (uint64_t)b[7]) & 0xFFFFFFFFULL;
-
-    fe_reduce_512(r, acc);
-}
-
-static void fe_sqr(uint* r, const uint* a) {
-    fe_mul(r, a, a);
-}
-
-static void fe_pow(uint* r, const uint* a, const uint* e) {
-    uint res[8] = {0,0,0,0,0,0,0,1};
-    uint base[8];
-    for (int i = 0; i < NL; i++) base[i] = a[i];
-    for (int i = 0; i < NL; i++) {
+// Modular inverse via Fermat: a^-1 = a^(p-2), MSB-first square-and-multiply.
+static void fe_inv(uint* r, const uint* a) {
+    uint e[8] = { 0xFFFFFC2Du, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                  0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+    uint res[8];
+    for (int i = 0; i < 8; i++) res[i] = R_MONT[i];
+    for (int i = 7; i >= 0; i--) {
         for (int bit = 31; bit >= 0; bit--) {
             uint t[8];
-            fe_mul(t, res, res);
-            for (int k = 0; k < NL; k++) res[k] = t[k];
+            mont_sqr(t, res);
+            for (int k = 0; k < 8; k++) res[k] = t[k];
             if ((e[i] >> bit) & 1u) {
                 uint u[8];
-                fe_mul(u, res, base);
-                for (int k = 0; k < NL; k++) res[k] = u[k];
+                mont_mul(u, res, a);
+                for (int k = 0; k < 8; k++) res[k] = u[k];
             }
         }
     }
-    for (int i = 0; i < NL; i++) r[i] = res[i];
+    for (int i = 0; i < 8; i++) r[i] = res[i];
 }
 
-static void fe_inv(uint* r, const uint* a) {
-    uint pm2[8];
-    for (int i = 0; i < NL; i++) pm2[i] = PM2[i];
-    fe_pow(r, a, pm2);
-}
+// ---- elliptic curve (Jacobian, Montgomery form) ---------------------------
 
-// ---- elliptic curve (Jacobian projective) --------------------------------
-//
-// Point = (X, Y, Z); affine x = X/Z^2, y = Y/Z^3.
-// Infinity = (1, 1, 0).
-
-static inline void jset(uint* X, uint* Y, uint* Z,
-                        const uint* Xs, const uint* Ys, const uint* Zs) {
-    for (int i = 0; i < NL; i++) {
-        X[i] = Xs[i];
-        Y[i] = Ys[i];
-        Z[i] = Zs[i];
+// Jacobian doubling R = 2*P (secp256k1 a=0).
+static void j_double(uint* RX, uint* RY, uint* RZ,
+                     const uint* PX, const uint* PY, const uint* PZ) {
+    if (fe_is_zero(PZ) || fe_is_zero(PY)) {
+        for (int i = 0; i < 8; i++) { RX[i] = 0; RY[i] = 0; RZ[i] = 0; }
+        return;
     }
+    uint t[8], alpha[8], gamma[8], beta[8], t1[8], t2[8];
+
+    mont_sqr(t, PX);          // t = X^2
+    mont_double(alpha, t);    // 2*X^2
+    mont_add(alpha, alpha, t); // 3*X^2
+    mont_sqr(gamma, PY);      // Y^2
+    mont_mul(beta, PX, gamma); // X*Y^2
+
+    mont_sqr(t1, alpha);       // alpha^2
+    mont_double(t2, beta);     // 2*beta
+    mont_double(t2, t2);       // 4*beta
+    mont_double(t2, t2);       // 8*beta
+    mont_sub(RX, t1, t2);      // X3 = alpha^2 - 8*beta
+
+    mont_mul(t1, PY, PZ);
+    mont_double(RZ, t1);       // Z3 = 2*Y*Z
+
+    mont_double(t1, beta);     // 2*beta
+    mont_double(t1, t1);       // 4*beta
+    mont_sub(t2, t1, RX);      // 4*beta - X3
+    mont_mul(t1, alpha, t2);   // alpha*(4*beta - X3)
+    mont_sqr(t2, gamma);       // gamma^2
+    mont_double(t2, t2);
+    mont_double(t2, t2);
+    mont_double(t2, t2);       // 8*gamma^2
+    mont_sub(RY, t1, t2);      // Y3
 }
 
-static inline void jset_inf(uint* X, uint* Y, uint* Z) {
-    uint one[8] = {0,0,0,0,0,0,0,1};
-    jset(X, Y, Z, one, one, one);
-    Z[7] = 0; // Z = 0 -> infinity, but keep X=Y=1 to avoid div-by-zero
-}
-
-// Jacobian point doubling: R = 2*P. Handles infinity.
-static void jdouble(uint* RX, uint* RY, uint* RZ,
-                    const uint* PX, const uint* PY, const uint* PZ) {
+// Mixed Jacobian + affine addition R = P(Jacobian) + Q(affine), no inversion.
+static void j_add_mixed(uint* RX, uint* RY, uint* RZ,
+                        const uint* PX, const uint* PY, const uint* PZ,
+                        const uint* qx, const uint* qy) {
     if (fe_is_zero(PZ)) {
-        jset_inf(RX, RY, RZ);
+        for (int i = 0; i < 8; i++) { RX[i] = qx[i]; RY[i] = qy[i]; RZ[i] = R_MONT[i]; }
         return;
     }
-    if (fe_is_zero(PY)) {
-        jset_inf(RX, RY, RZ);
-        return;
-    }
+    uint z1z1[8], u2[8], s2[8], h[8], r[8], z1cubed[8];
+    mont_sqr(z1z1, PZ);
+    mont_mul(u2, qx, z1z1);
+    mont_mul(z1cubed, PZ, z1z1);
+    mont_mul(s2, qy, z1cubed);
 
-    uint gamma[8];   // Y^2
-    uint beta[8];    // X*gamma
-    uint alpha[8];   // 3*X^2  (secp256k1 has a=0)
-    uint t1[8], t2[8], t3[8];
-
-    // NOTE: the standard Jacobian doubling formula with a != 0 needs
-    // delta = Z^2, but secp256k1 has a=0 so alpha = 3*X^2 directly and
-    // Z^2 is never used. The old `fe_sqr(delta, PZ)` was dead work —
-    // one full field multiply (64 mul + 40-pass reduce) per doubling,
-    // i.e. ~256 wasted multiplies per scalar_mul. Removing it is a pure
-    // win with no semantic change (self-test still validates equality).
-
-    fe_sqr(gamma, PY);
-    fe_mul(beta, PX, gamma);
-
-    // alpha = 3 * X^2
-    fe_sqr(t1, PX);
-    fe_add(alpha, t1, t1);
-    fe_add(alpha, alpha, t1);
-
-    // X3 = alpha^2 - 8*beta  (mod P)
-    fe_sqr(t1, alpha);
-    fe_add(t2, beta, beta);
-    fe_add(t2, t2, t2);
-    fe_add(t2, t2, t2); // 8*beta
-    fe_sub_mod(RX, t1, t2);
-
-    // Z3 = 2*Y*Z  (mod P)
-    fe_mul(t1, PY, PZ);
-    fe_add(RZ, t1, t1);
-
-    // Y3 = alpha*(4*beta - X3) - 8*gamma^2  (mod P)
-    fe_add(t1, beta, beta);
-    fe_add(t1, t1, t1); // 4*beta
-    fe_sub_mod(t2, t1, RX);
-    fe_mul(t3, alpha, t2);
-    fe_sqr(t1, gamma);
-    fe_add(t2, t1, t1);
-    fe_add(t2, t2, t2);
-    fe_add(t2, t2, t2); // 8*gamma^2
-    fe_sub_mod(RY, t3, t2);
-}
-
-// Mixed Jacobian + affine addition: R = P(Jacobian) + Q(affine, constant mem).
-// Handles infinity and P == Q / P == -Q.
-static void jadd_mixed(uint* RX, uint* RY, uint* RZ,
-                       const uint* PX, const uint* PY, const uint* PZ,
-                       constant uint* QX, constant uint* QY) {
-    // Copy constant Q into private arrays so all downstream field helpers
-    // (which expect private address-space pointers) can be reused unchanged.
-    uint qx[8], qy[8];
-    for (int i = 0; i < NL; i++) { qx[i] = QX[i]; qy[i] = QY[i]; }
-
-    if (fe_is_zero(PZ)) {
-        for (int i = 0; i < NL; i++) {
-            RX[i] = qx[i];
-            RY[i] = qy[i];
-        }
-        uint one[8] = {0,0,0,0,0,0,0,1};
-        for (int i = 0; i < NL; i++) RZ[i] = one[i];
-        return;
-    }
-
-    uint z2[8], z3[8];
-    fe_sqr(z2, PZ);
-    fe_mul(z3, z2, PZ);
-
-    uint u2[8], s2[8];
-    fe_mul(u2, qx, z2);
-    fe_mul(s2, qy, z3);
-
-    uint h[8], rr[8];
-    fe_sub_mod(h, u2, PX);
-    fe_sub_mod(rr, s2, PY);
+    mont_sub(h, u2, PX);
+    mont_sub(r, s2, PY);
 
     if (fe_is_zero(h)) {
-        if (fe_is_zero(rr)) {
-            // P == Q (affine Q == Jacobian P)
-            jdouble(RX, RY, RZ, PX, PY, PZ);
+        if (fe_is_zero(r)) {
+            j_double(RX, RY, RZ, PX, PY, PZ);
         } else {
-            // P == -Q
-            jset_inf(RX, RY, RZ);
+            for (int i = 0; i < 8; i++) { RX[i] = 0; RY[i] = 0; RZ[i] = 0; }
         }
         return;
     }
 
-    uint h2[8], h3[8], u1h2[8], t1[8], t2[8];
-    fe_sqr(h2, h);
-    fe_mul(h3, h2, h);
-    fe_mul(u1h2, PX, h2);
+    uint hh[8], i4[8], j[8], v[8], t1[8], t2[8], t3[8];
+    mont_sqr(hh, h);
+    mont_double(i4, hh);       // 2*HH
+    mont_double(i4, i4);       // 4*HH
+    mont_mul(j, h, i4);
+    mont_double(r, r);         // 2*(S2 - Y1)
+    mont_mul(v, PX, i4);
 
-    // X3 = r^2 - h^3 - 2*u1h2  (mod P)
-    fe_sqr(t1, rr);
-    fe_sub_mod(t2, t1, h3);
-    fe_add(t1, u1h2, u1h2); // 2*u1h2, reduced
-    fe_sub_mod(RX, t2, t1);
+    mont_sqr(t1, r);           // r^2
+    mont_sub(t2, t1, j);       // r^2 - J
+    mont_double(t3, v);        // 2*V
+    mont_sub(RX, t2, t3);      // X3 = r^2 - J - 2*V
 
-    // Y3 = r*(u1h2 - X3) - s1*h^3  (mod P)
-    fe_sub_mod(t1, u1h2, RX);
-    fe_mul(t2, rr, t1);
-    fe_mul(t1, PY, h3);
-    fe_sub_mod(RY, t2, t1);
+    mont_sub(t1, v, RX);       // V - X3
+    mont_mul(t2, r, t1);       // r*(V - X3)
+    mont_mul(t3, PY, j);       // Y1*J
+    mont_double(t3, t3);       // 2*Y1*J
+    mont_sub(RY, t2, t3);      // Y3
 
-    // Z3 = Z1 * h
-    fe_mul(RZ, PZ, h);
+    mont_add(t1, PZ, h);       // Z1 + H
+    mont_sqr(t2, t1);          // (Z1+H)^2
+    mont_sub(t3, t2, z1z1);    // - Z1Z1
+    mont_sub(RZ, t3, hh);      // Z3 = (Z1+H)^2 - Z1Z1 - HH
 }
 
-// Convert Jacobian point to affine. If point is infinity, sets Qx=0, Qy=0.
-static void jto_affine(uint* Qx, uint* Qy,
-                       const uint* X, const uint* Y, const uint* Z) {
+// Convert Jacobian to affine (Montgomery form): x = X/Z^2, y = Y/Z^3.
+static void j_to_affine(uint* Qx, uint* Qy,
+                        const uint* X, const uint* Y, const uint* Z) {
     if (fe_is_zero(Z)) {
-        for (int i = 0; i < NL; i++) { Qx[i] = 0; Qy[i] = 0; }
+        for (int i = 0; i < 8; i++) { Qx[i] = 0; Qy[i] = 0; }
         return;
     }
-    uint z2[8], z3[8], invz2[8], invz3[8];
-    fe_sqr(z2, Z);
-    fe_mul(z3, z2, Z);
-    fe_inv(invz2, z2);
-    fe_inv(invz3, z3);
-    fe_mul(Qx, X, invz2);
-    fe_mul(Qy, Y, invz3);
+    uint z2[8], z3[8], invz[8], invz2[8], invz3[8];
+    mont_sqr(z2, Z);
+    mont_mul(z3, z2, Z);
+    fe_inv(invz, Z);           // single inversion
+    mont_sqr(invz2, invz);
+    mont_mul(invz3, invz2, invz);
+    mont_mul(Qx, X, invz2);
+    mont_mul(Qy, Y, invz3);
 }
 
-static void scalar_mul(uint* Qx, uint* Qy, const uint* k) {
-    uint RX[8], RY[8], RZ[8];
-    jset_inf(RX, RY, RZ);
-    int Rinf = 1;
-
-    for (int i = 0; i < NL; i++) {
-        for (int bit = 31; bit >= 0; bit--) {
-            uint kb = (k[i] >> bit) & 1u;
-
-            if (!Rinf) {
-                uint TX[8], TY[8], TZ[8];
-                jdouble(TX, TY, TZ, RX, RY, RZ);
-                jset(RX, RY, RZ, TX, TY, TZ);
-            }
-
-            if (kb) {
-                if (Rinf) {
-                    for (int t = 0; t < NL; t++) {
-                        RX[t] = GX[t];
-                        RY[t] = GY[t];
-                    }
-                    uint one[8] = {0,0,0,0,0,0,0,1};
-                    for (int t = 0; t < NL; t++) RZ[t] = one[t];
-                    Rinf = 0;
-                } else {
-                    uint TX[8], TY[8], TZ[8];
-                    jadd_mixed(TX, TY, TZ, RX, RY, RZ, GX, GY);
-                    jset(RX, RY, RZ, TX, TY, TZ);
-                }
-            }
-        }
-    }
-
-    jto_affine(Qx, Qy, RX, RY, RZ);
-}
-
-// ---- Radeon-friendly multi-dispatch scalar multiplication -----------------
-//
-// This is an EXPERIMENTAL path, gated off by default in the host (see
-// gpu.rs `radeon_scalar_mul`). The Apple OpenCL 1.2 / AMD Radeon driver
-// (cvms) crashes (`cvms_element_build_from_source`) when it statically
-// unrolls the 256-iteration double-and-add loop in `scalar_mul` and inlines
-// the Jacobian helpers past its internal limit. Empirical binary search in
-// the diagnostic examples showed a SINGLE function call per kernel is fine
-// (256x a single `jdouble` builds), but any two calls per iteration
-// (`jdouble`+`jadd`, or 2x `jdouble`) blows up.
-//
-// Workaround: move the loop OUT of the kernel. The host drives 256 dispatches,
-// each invoking `step_bit` exactly once (no loop, one outer call). The running
-// Jacobian point is kept in a global scratch buffer `pubs` (3*8 = 24 uints per
-// work-item: RX, RY, RZ). This is mathematically identical to `scalar_mul()`.
-//
-// These kernels are appended to the same source file so they are always
-// compiled (they compile fine on every driver); only the *host dispatch path*
-// is gated. Keeping them compiled means `--self-test` can exercise them too.
-
-// Initialize pubs to the Jacobian point at infinity (RZ = 0, RX=RY=1).
-__kernel void radeon_init_inf(__global uint* pubs) {
-    size_t gid = get_global_id(0);
-    size_t off = gid * 24;
-    for (int i = 0; i < 8; i++) {
-        pubs[off + i]      = 0; // RX
-        pubs[off + 8 + i]  = 0; // RY
-        pubs[off + 16 + i] = 0; // RZ
-    }
-    // RX = RY = 1, RZ = 0 -> infinity marker
-    pubs[off + 7] = 1;
-    pubs[off + 8 + 7] = 1;
-}
-
-// Process one bit (bit_index in [0,255], MSB first) of each key.
-// bit_index 0 -> k[0] bit 31, bit_index 255 -> k[7] bit 0.
-// `bit_index` is passed via a 1-element global buffer (written by the host per
-// dispatch) rather than a scalar arg, because some OpenCL runtimes do not
-// reliably re-read a scalar argument value that is mutated between dispatches.
-__kernel void radeon_step_bit(__global uint* pubs, __global uint* base, __global int* bit_index) {
-    int bit_index_local = bit_index[0];
-    size_t gid = get_global_id(0);
-    size_t off = gid * 24;
-
-    uint key[8];
-    for (int i = 0; i < 8; i++) key[i] = base[i];
-    uint64_t carry = (uint64_t)gid;
-    for (int i = 7; i >= 0 && carry; i--) {
-        uint64_t s = (uint64_t)key[i] + carry;
-        key[i] = (uint)s;
-        carry = s >> 32;
-    }
-
-    int limb = bit_index_local / 32;
-    int bit  = 31 - (bit_index_local % 32);
-    uint kb = (key[limb] >> bit) & 1u;
-
-    uint RX[8], RY[8], RZ[8];
-    for (int i = 0; i < 8; i++) {
-        RX[i] = pubs[off + i];
-        RY[i] = pubs[off + 8 + i];
-        RZ[i] = pubs[off + 16 + i];
-    }
-
-    // double
-    uint TX[8], TY[8], TZ[8];
-    jdouble(TX, TY, TZ, RX, RY, RZ);
-    for (int t = 0; t < NL; t++) { RX[t] = TX[t]; RY[t] = TY[t]; RZ[t] = TZ[t]; }
-
-    if (kb) {
-        // add G (affine, constant memory)
-        uint qx[8], qy[8];
-        for (int i = 0; i < NL; i++) { qx[i] = GX[i]; qy[i] = GY[i]; }
-        if (fe_is_zero(RZ)) {
-            for (int i = 0; i < NL; i++) { RX[i] = qx[i]; RY[i] = qy[i]; }
-            uint one[8] = {0,0,0,0,0,0,0,1};
-            for (int i = 0; i < NL; i++) RZ[i] = one[i];
-        } else {
-            uint z2[8], z3[8], u2[8], s2[8], h[8], rr[8];
-            fe_sqr(z2, RZ); fe_mul(z3, z2, RZ);
-            fe_mul(u2, qx, z2); fe_mul(s2, qy, z3);
-            fe_sub_mod(h, u2, RX); fe_sub_mod(rr, s2, RY);
-            if (fe_is_zero(h)) {
-                uint one[8] = {0,0,0,0,0,0,0,1};
-                for (int i = 0; i < NL; i++) { RX[i] = one[i]; RY[i] = one[i]; }
-                RZ[7] = 0;
-            } else {
-                uint h2[8], h3[8], u1h2[8], t1[8], t2[8];
-                fe_sqr(h2, h); fe_mul(h3, h2, h); fe_mul(u1h2, RX, h2);
-                fe_sqr(t1, rr); fe_sub_mod(t2, t1, h3);
-                fe_add(t1, u1h2, u1h2); fe_sub_mod(TX, t2, t1);
-                fe_sub_mod(t1, u1h2, RX); fe_mul(t2, rr, t1);
-                fe_mul(t1, qy, h3); fe_sub_mod(TY, t2, t1);
-                fe_mul(TZ, RZ, h);
-                for (int i = 0; i < NL; i++) { RX[i] = TX[i]; RY[i] = TY[i]; RZ[i] = TZ[i]; }
-            }
-        }
-    }
-
-    for (int i = 0; i < 8; i++) {
-        pubs[off + i]      = RX[i];
-        pubs[off + 8 + i]  = RY[i];
-        pubs[off + 16 + i] = RZ[i];
-    }
-}
-
-// Convert the Jacobian point in pubs to affine (Qx,Qy) written at off..16,
-// matching the layout produced by derive_pubkeys (so hash_addrs can reuse it).
-__kernel void radeon_finalize_affine(__global uint* pubs) {
-    size_t gid = get_global_id(0);
-    size_t off = gid * 24;
-
-    uint RX[8], RY[8], RZ[8];
-    for (int i = 0; i < 8; i++) {
-        RX[i] = pubs[off + i];
-        RY[i] = pubs[off + 8 + i];
-        RZ[i] = pubs[off + 16 + i];
-    }
-    uint Qx[8], Qy[8];
-    jto_affine(Qx, Qy, RX, RY, RZ);
-    size_t aoff = gid * 16;
-    for (int i = 0; i < 8; i++) {
-        pubs[aoff + i]      = Qx[i];
-        pubs[aoff + 8 + i]  = Qy[i];
-    }
-}
-
-// ---- keccak-256 ----------------------------------------------------------
+// ---- keccak-256 -----------------------------------------------------------
 
 static inline uint64_t rotl64(uint64_t x, uint64_t n) {
     return (x << n) | (x >> (64 - n));
@@ -621,12 +287,6 @@ static void keccak_f(uint64_t* st) {
     const int PILN[24] = {
         10,7,11,17,18,3,5,16,8,21,24,4,15,23,19,13,12,2,20,14,22,9,6,1
     };
-    // `rounds` is intentionally NOT volatile: a volatile induction variable
-    // forces the compiler to reload it from memory every iteration and blocks
-    // loop unrolling / pipelining, which measurably slows keccak on AMD
-    // (comgr backend). The Apple 1.2 workaround that once needed `volatile`
-    // here is long gone — the loop body is fully constant-indexed and
-    // compiles correctly on every vendor.
     for (int round = 0; round < 24; round++) {
         uint64_t bc[5];
         for (int i = 0; i < 5; i++)
@@ -642,8 +302,6 @@ static void keccak_f(uint64_t* st) {
             st[j] = rotl64(tmp, (uint64_t)ROTC[i]);
             tmp = t;
         }
-        // chi step: tc hoisted out of the j-loop so the compiler allocates it
-        // once instead of (potentially) per-iteration.
         uint64_t tc[5];
         for (int j = 0; j < 5; j++) {
             for (int i = 0; i < 5; i++) tc[i] = st[j*5 + i];
@@ -654,12 +312,15 @@ static void keccak_f(uint64_t* st) {
     }
 }
 
-static void keccak256_addr(const uint* x, const uint* y, __global uchar* out_addr) {
+// keccak256 of the 64-byte (x || y) big-endian byte buffer -> 20-byte address.
+static void keccak256_addr(const uint* xbytes, const uint* ybytes, uchar* out_addr) {
+    // xbytes / ybytes are 8 u32 each holding 4 bytes, big-endian byte order
+    // (xbytes[0] holds the most-significant 4 bytes of x).
     uint64_t st[25];
     for (int i = 0; i < 25; i++) st[i] = 0;
     for (int lane = 0; lane < 8; lane++) {
-        uint a = (lane < 4) ? x[2 * lane]     : y[2 * (lane - 4)];
-        uint b = (lane < 4) ? x[2 * lane + 1] : y[2 * (lane - 4) + 1];
+        uint a = (lane < 4) ? xbytes[2 * lane]     : ybytes[2 * (lane - 4)];
+        uint b = (lane < 4) ? xbytes[2 * lane + 1] : ybytes[2 * (lane - 4) + 1];
         uint64_t v = 0;
         v |= ((uint64_t)((a >> 24) & 0xFF));
         v |= ((uint64_t)((a >> 16) & 0xFF)) << 8;
@@ -677,84 +338,109 @@ static void keccak256_addr(const uint* x, const uint* y, __global uchar* out_add
     for (int i = 0; i < 20; i++) out_addr[i] = (uchar)(st[(12 + i) / 8] >> (8 * ((12 + i) % 8)));
 }
 
-// ---- matching ------------------------------------------------------------
+// ---- key helpers ----------------------------------------------------------
 
-static void key_add_gid(uint* key, __global uint* base, uint64_t gid) {
+// key = base + gid (little-endian add), gid added at the least-significant limb.
+static void key_add_gid(uint* key, __global const uint* base, uint64_t gid) {
     for (int i = 0; i < 8; i++) key[i] = base[i];
     uint64_t carry = gid;
-    for (int i = 7; i >= 0 && carry; i--) {
+    for (int i = 0; i < 8 && carry; i++) {
         uint64_t s = (uint64_t)key[i] + carry;
         key[i] = (uint)s;
         carry = s >> 32;
     }
 }
 
-__kernel void derive_pubkeys(__global uint* restrict base, __global uint* restrict pubs) {
+// Extract the i-th byte of a little-endian 8-limb key, in big-endian order
+// (i == 0 is the most-significant byte, i == 31 the least-significant).
+static uint key_byte(const uint* key, int i) {
+    int word = 7 - i / 4;
+    int shift = 24 - (i % 4) * 8;
+    return (key[word] >> shift) & 0xFFu;
+}
+
+// ---- kernels --------------------------------------------------------------
+
+// precomp layout: 32 columns x 255 points x 16 u32 (x[8] then y[8]), all in
+// Montgomery form. column i holds (b * 256^(31-i)) * G for b = 1..255.
+//
+// derive_points: for each work item, compute (base+gid)*G and emit the affine
+// public key as 16 big-endian u32 (x[8] then y[8], x[0] most significant).
+__kernel void derive_points(__global uint* restrict base,
+                            __global const uint* restrict precomp,
+                            __global uint* restrict out) {
     size_t gid = get_global_id(0);
-    size_t off = gid * 16;
 
     uint key[8];
     key_add_gid(key, base, (uint64_t)gid);
 
-    uint Qx[8], Qy[8];
-    scalar_mul(Qx, Qy, key);
+    // Accumulator R in Jacobian form, starting at infinity (RZ == 0).
+    uint RX[8], RY[8], RZ[8];
+    for (int i = 0; i < 8; i++) { RX[i] = 0; RY[i] = 0; RZ[i] = 0; }
 
-    for (int i = 0; i < 8; i++) {
-        pubs[off + i]     = Qx[i];
-        pubs[off + 8 + i] = Qy[i];
+    for (int i = 0; i < 32; i++) {
+        uint byte = key_byte(key, i);
+        if (byte != 0) {
+            uint qx[8], qy[8];
+            uint off = (uint)i * 255u * 16u + (byte - 1u) * 16u;
+            for (int k = 0; k < 8; k++) {
+                qx[k] = precomp[off + k];
+                qy[k] = precomp[off + 8 + k];
+            }
+            uint TX[8], TY[8], TZ[8];
+            j_add_mixed(TX, TY, TZ, RX, RY, RZ, qx, qy);
+            for (int k = 0; k < 8; k++) { RX[k] = TX[k]; RY[k] = TY[k]; RZ[k] = TZ[k]; }
+        }
+    }
+
+    // Affine conversion, then de-Montgomery, then emit big-endian u32.
+    uint ax[8], ay[8];
+    j_to_affine(ax, ay, RX, RY, RZ);
+    uint cx[8], cy[8];
+    from_mont(cx, ax);
+    from_mont(cy, ay);
+
+    size_t off = gid * 16;
+    for (int k = 0; k < 8; k++) {
+        out[off + k]     = cx[7 - k]; // little-endian cx -> big-endian out
+        out[off + 8 + k] = cy[7 - k];
     }
 }
 
-__kernel void hash_addrs(__global uint* restrict pubs, __global uchar* restrict addrs) {
+// hash_match: keccak256(x||y) -> EVM address, then prefix/suffix match.
+// params layout (u32):
+//   [0]      = prefix_len
+//   [1]      = suffix_len (group 0)
+//   [2..9]   = base[8] (little-endian, for private-key recovery)
+//   [10..49] = prefix nibbles (40 slots)
+//   [50..89] = group-0 suffix nibbles (40 slots)
+//   [90]     = num_alt_suffixes
+//   [91]     = alt suffix length
+//   [92..]   = alt suffix nibbles, 40 slots per group
+__kernel void hash_match(__global uint* restrict base,
+                         __global const uint* restrict points,
+                         __global int*  restrict out_found,
+                         __global uint* restrict out_priv,
+                         __global uchar* restrict out_addr,
+                         __global uint* restrict params) {
     size_t gid = get_global_id(0);
     size_t off = gid * 16;
-    size_t addr_off = gid * 20;
 
-    uint Qx[8], Qy[8];
+    uint xb[8], yb[8];
     for (int i = 0; i < 8; i++) {
-        Qx[i] = pubs[off + i];
-        Qy[i] = pubs[off + 8 + i];
+        xb[i] = points[off + i];
+        yb[i] = points[off + 8 + i];
     }
-    keccak256_addr(Qx, Qy, &addrs[addr_off]);
-}
 
-// params layout:
-//   [0]      = prefix_len
-//   [1]      = primary suffix_len (group 0)
-//   [2..9]   = base[8]
-//   [10..49] = prefix nibbles (40 slots)
-//   [50..89] = primary suffix nibbles (group 0, 40 slots)
-//   [90]     = num_alt_suffixes (extra groups, 0 = single-suffix legacy mode)
-//   [91]     = alt suffix length (all alt groups share this length; equal to
-//              group 0's length, enforced on the host)
-//   [92..]   = alt suffix nibbles, each group packed into 40 slots:
-//              group g (1-based) occupies [92 + (g-1)*40 .. 92 + (g-1)*40 + 40)
-//
-// Backward compatibility: when num_alt_suffixes == 0 the matching logic below
-// reduces EXACTLY to the original single-suffix comparison (prefix + group 0
-// only), so existing self-tests and the verified Windows/AMD path are
-// unaffected.
-__kernel void match_addrs(__global uint* restrict base,
-                          __global uchar* restrict addrs,
-                          __global int*  restrict out_found,
-                          __global uint* restrict out_priv,
-                          __global uchar* restrict out_addr,
-                          __global uint* restrict params) {
-    size_t gid = get_global_id(0);
-    size_t addr_off = gid * 20;
+    uchar addr[20];
+    keccak256_addr(xb, yb, addr);
 
     uint prefix_len = params[0];
     uint suffix_len = params[1];
     uint num_alt = params[90];
     uint alt_len = params[91];
 
-    uint key[8];
-    key_add_gid(key, base, (uint64_t)gid);
-
-    uchar addr[20];
-    for (int i = 0; i < 20; i++) addr[i] = addrs[addr_off + i];
-
-    // Match prefix first (shared across all groups).
+    // Match prefix.
     int prefix_ok = 1;
     for (uint i = 0; i < prefix_len; i++) {
         uchar n = (i & 1u) ? (addr[i / 2] & 0xF) : ((addr[i / 2] >> 4) & 0xF);
@@ -762,15 +448,14 @@ __kernel void match_addrs(__global uint* restrict base,
     }
     if (!prefix_ok) return;
 
-    // Try group 0 (primary suffix).
+    // Match group 0.
     int match = 1;
     for (uint i = 0; i < suffix_len; i++) {
         uint idx = 40u - suffix_len + i;
         uchar n = (idx & 1u) ? (addr[idx / 2] & 0xF) : ((addr[idx / 2] >> 4) & 0xF);
         if (n != (uchar)(params[50 + i])) { match = 0; break; }
     }
-
-    // Try alternative suffix groups (any one hitting is enough).
+    // Match alternative groups.
     for (uint g = 0; g < num_alt && !match; g++) {
         uint base_off = 92u + g * 40u;
         int matched_local = 1;
@@ -785,6 +470,8 @@ __kernel void match_addrs(__global uint* restrict base,
     if (match) {
         int idx = atomic_inc(out_found);
         if (idx == 0) {
+            uint key[8];
+            key_add_gid(key, base, (uint64_t)gid);
             for (int i = 0; i < 8; i++) out_priv[i] = key[i];
             for (int i = 0; i < 20; i++) out_addr[i] = addr[i];
         }
