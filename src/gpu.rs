@@ -118,6 +118,11 @@ fn add_u64_le(key: &mut [u32; 8], off: u64) {
 /// constant; 256 is a safe default for AMD RDNA2/3 and NVIDIA GPUs.
 const WORK_GROUP_SIZE: usize = 256;
 
+/// Number of points each batch_affine work item processes. Smaller chunks give
+/// more parallelism; larger chunks reduce the per-chunk inverse overhead. Must
+/// divide `batch` exactly.
+const BATCH_AFFINE_CHUNK_SIZE: usize = 4096;
+
 /// Build (global, local) work dimensions for a 1-D kernel over `batch` items.
 /// If `batch` is smaller than the work-group size we shrink the local size so
 /// the dispatch is still valid (global must be a multiple of local).
@@ -310,6 +315,7 @@ fn probe_one_vector(
         if batch_affine
             .cmd()
             .global_work_size(SpatialDims::One(1))
+            .local_work_size(SpatialDims::One(1))
             .enq()
             .is_err()
         {
@@ -430,6 +436,7 @@ fn probe_device(proque: &ProQue) -> bool {
         .arg(&points)
         .arg(&affine)
         .arg(&scratch)
+        .arg(1u32)
         .arg(1u32)
         .build()
     {
@@ -760,6 +767,7 @@ pub fn run_gpu(
         .arg(&affine)
         .arg(&scratch)
         .arg(batch as u32)
+        .arg(BATCH_AFFINE_CHUNK_SIZE as u32)
         .build();
     let matcher = proque
         .kernel_builder("hash_match")
@@ -866,10 +874,13 @@ pub fn run_gpu(
             iter_ok = false;
         }
         if iter_ok {
+            let affine_items = batch / BATCH_AFFINE_CHUNK_SIZE;
+            let (g_ba, l_ba) = work_dims(affine_items.max(1));
             unsafe {
                 if batch_affine
                     .cmd()
-                    .global_work_size(SpatialDims::One(1))
+                    .global_work_size(g_ba)
+                    .local_work_size(l_ba)
                     .enq()
                     .is_err()
                 {
@@ -1134,6 +1145,7 @@ pub fn self_test(selection: DeviceSelection) -> bool {
         .arg(&affine)
         .arg(&scratch)
         .arg(1u32)
+        .arg(1u32)
         .build()
         .unwrap();
     let matcher = proque
@@ -1192,6 +1204,7 @@ pub fn self_test(selection: DeviceSelection) -> bool {
             batch_affine
                 .cmd()
                 .global_work_size(SpatialDims::One(1))
+                .local_work_size(SpatialDims::One(1))
                 .enq()
                 .unwrap();
         }
@@ -1315,6 +1328,7 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
         .arg(&affine)
         .arg(&scratch)
         .arg(batch as u32)
+        .arg(BATCH_AFFINE_CHUNK_SIZE as u32)
         .build()
         .ok()?;
     let matcher = proque
@@ -1355,10 +1369,13 @@ pub fn benchmark(seconds: u64, batch: usize, selection: DeviceSelection) -> Opti
                 .ok()?;
         }
         proque.queue().finish().ok()?;
+        let affine_items = batch / BATCH_AFFINE_CHUNK_SIZE;
+        let (g_ba, l_ba) = work_dims(affine_items.max(1));
         unsafe {
             batch_affine
                 .cmd()
-                .global_work_size(SpatialDims::One(1))
+                .global_work_size(g_ba)
+                .local_work_size(l_ba)
                 .enq()
                 .ok()?;
         }

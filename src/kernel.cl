@@ -438,49 +438,63 @@ __kernel void derive_points(__global uint* restrict base,
     }
 }
 
-// Batch affine conversion using Montgomery's trick: for a batch of Jacobian
-// points (X_i, Y_i, Z_i) compute the affine (x_i, y_i) with only one modular
-// inverse for the entire batch.
+// Batch affine conversion using Montgomery's trick.
 //
-// Inputs : out_jac[batch * 24] little-endian Jacobian points.
+// To avoid a single work-item bottleneck, the batch is split into independent
+// chunks of `chunk_size` points. Each work item handles one chunk with its own
+// Montgomery's trick (one inverse per chunk). This keeps the per-point cost at
+// ~3 muls + 1 inv/chunk while exposing enough parallelism to saturate the GPU.
+//
+// Inputs : jac[batch * 24] little-endian Jacobian points.
 // Outputs: out_affine[batch * 16] big-endian x[8] then y[8].
-// Scratch: scratch[batch * 8] prefix products (internal).
-__attribute__((reqd_work_group_size(1, 1, 1)))
+// Scratch: scratch[batch * 8] prefix products (internal, one per point).
+// Params : batch (total points), chunk_size (points per work item).
 __kernel void batch_affine(__global const uint* restrict jac,
                            __global uint* restrict out_affine,
                            __global uint* restrict scratch,
-                           uint batch) {
-    if (batch == 0) return;
+                           uint batch,
+                           uint chunk_size) {
+    if (batch == 0 || chunk_size == 0) return;
 
-    // Forward pass: scratch[i] = prod_{j=0..i} Z_j.
+    size_t gid = get_global_id(0);
+    size_t start = gid * (size_t)chunk_size;
+    if (start >= batch) return;
+    size_t end = start + chunk_size;
+    if (end > batch) end = batch;
+    size_t n = end - start;
+    if (n == 0) return;
+
+    // Forward pass within this chunk: scratch[start+i] = prod_{j=start..start+i} Z_j.
     uint prod[8];
-    for (uint i = 0; i < batch; i++) {
+    for (size_t i = 0; i < n; i++) {
+        size_t idx = start + i;
         uint z[8];
-        size_t base = (size_t)i * 24 + 16;
-        for (int k = 0; k < 8; k++) z[k] = jac[base + k];
+        size_t zbase = idx * 24 + 16;
+        for (int k = 0; k < 8; k++) z[k] = jac[zbase + k];
         if (i == 0) {
             for (int k = 0; k < 8; k++) prod[k] = z[k];
         } else {
             mont_mul(prod, z, prod);
         }
-        size_t soff = (size_t)i * 8;
+        size_t soff = idx * 8;
         for (int k = 0; k < 8; k++) scratch[soff + k] = prod[k];
     }
 
-    // Single inverse of the total product.
+    // Single inverse for this chunk's total product.
     uint inv[8];
     fe_inv(inv, prod);
 
-    // Backward pass: derive each Z_i^-1 and convert to affine.
-    for (int idx = (int)batch - 1; idx >= 0; idx--) {
+    // Backward pass within this chunk.
+    for (size_t i = n; i-- > 0;) {
+        size_t idx = start + i;
         uint z[8];
-        size_t jbase = (size_t)idx * 24 + 16;
-        for (int k = 0; k < 8; k++) z[k] = jac[jbase + k];
+        size_t zbase = idx * 24 + 16;
+        for (int k = 0; k < 8; k++) z[k] = jac[zbase + k];
 
         uint z_inv[8];
-        if (idx > 0) {
+        if (i > 0) {
             uint pprev[8];
-            size_t soff = (size_t)(idx - 1) * 8;
+            size_t soff = (idx - 1) * 8;
             for (int k = 0; k < 8; k++) pprev[k] = scratch[soff + k];
             mont_mul(z_inv, inv, pprev);
         } else {
@@ -491,7 +505,7 @@ __kernel void batch_affine(__global const uint* restrict jac,
         mont_sqr(z2_inv, z_inv);
         mont_mul(z3_inv, z2_inv, z_inv);
 
-        size_t xybase = (size_t)idx * 24;
+        size_t xybase = idx * 24;
         uint px[8], py[8];
         for (int k = 0; k < 8; k++) {
             px[k] = jac[xybase + k];
@@ -504,13 +518,13 @@ __kernel void batch_affine(__global const uint* restrict jac,
         from_mont(cx, ax);
         from_mont(cy, ay);
 
-        size_t obase = (size_t)idx * 16;
+        size_t obase = idx * 16;
         for (int k = 0; k < 8; k++) {
             out_affine[obase + k]     = cx[7 - k];
             out_affine[obase + 8 + k] = cy[7 - k];
         }
 
-        // inv = inv * Z_idx for the next (more significant) position.
+        // inv = inv * Z_idx for the next (more significant) position within chunk.
         uint t[8];
         mont_mul(t, inv, z);
         for (int k = 0; k < 8; k++) inv[k] = t[k];
