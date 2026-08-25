@@ -51,9 +51,14 @@ static inline int fe_is_zero(const uint* a) {
 
 // Montgomery multiply (CIOS): r = a * b * R^-1 mod p.
 // Verbatim port of src/mont.rs::mont_mul (10-limb accumulator).
-// P is copied to a local __private array so the inner loop only references
-// __private pointers (CL 1.2 compatible).
+// P is copied to a local __private array so every helper pointer stays in the
+// default __private address space. AMD's comgr (gfx1031) rejects passing a
+// __constant global directly to a __private parameter even though some other
+// drivers allow it.
 static void mont_mul(uint* r, const uint* a, const uint* b) {
+    uint P_loc[8];
+    for (int j = 0; j < 8; j++) P_loc[j] = P[j];
+
     uint64_t t[10];
     for (int i = 0; i < 10; i++) t[i] = 0;
 
@@ -72,7 +77,7 @@ static void mont_mul(uint* r, const uint* a, const uint* b) {
 
         carry = 0;
         for (int j = 0; j < 8; j++) {
-            v = t[j] + (uint64_t)m * (uint64_t)P[j] + carry;
+            v = t[j] + (uint64_t)m * (uint64_t)P_loc[j] + carry;
             if (j >= 1) t[j - 1] = v & 0xFFFFFFFFULL;
             carry = v >> 32;
         }
@@ -86,10 +91,10 @@ static void mont_mul(uint* r, const uint* a, const uint* b) {
 
     for (int j = 0; j < 8; j++) r[j] = (uint)t[j];
     // Final reduction: t[8] is 0 or 1; subtract p once if >= p.
-    if (t[8] > 0 || fe_ge(r, P)) {
+    if (t[8] > 0 || fe_ge(r, P_loc)) {
         int64_t borrow = 0;
         for (int j = 0; j < 8; j++) {
-            int64_t cur = (int64_t)r[j] - (int64_t)P[j] - borrow;
+            int64_t cur = (int64_t)r[j] - (int64_t)P_loc[j] - borrow;
             if (cur < 0) { r[j] = (uint)(cur + (1LL << 32)); borrow = 1; }
             else { r[j] = (uint)cur; borrow = 0; }
         }
@@ -100,6 +105,9 @@ static void mont_sqr(uint* r, const uint* a) { mont_mul(r, a, a); }
 
 // Montgomery addition (a + b) mod p, with a 9th carry limb.
 static void mont_add(uint* r, const uint* a, const uint* b) {
+    uint P_loc[8];
+    for (int j = 0; j < 8; j++) P_loc[j] = P[j];
+
     uint64_t t[9];
     uint64_t carry = 0;
     for (int i = 0; i < 8; i++) {
@@ -108,10 +116,10 @@ static void mont_add(uint* r, const uint* a, const uint* b) {
         carry = v >> 32;
     }
     t[8] = carry;
-    if (t[8] > 0 || fe_ge((uint*)t, P)) {
+    if (t[8] > 0 || fe_ge((uint*)t, P_loc)) {
         int64_t borrow = 0;
         for (int i = 0; i < 8; i++) {
-            int64_t cur = (int64_t)t[i] - (int64_t)P[i] - borrow;
+            int64_t cur = (int64_t)t[i] - (int64_t)P_loc[i] - borrow;
             if (cur < 0) { t[i] = (uint64_t)(cur + (1LL << 32)); borrow = 1; }
             else { t[i] = (uint64_t)cur; borrow = 0; }
         }
@@ -121,6 +129,9 @@ static void mont_add(uint* r, const uint* a, const uint* b) {
 
 // Montgomery subtraction (a - b) mod p.
 static void mont_sub(uint* r, const uint* a, const uint* b) {
+    uint P_loc[8];
+    for (int j = 0; j < 8; j++) P_loc[j] = P[j];
+
     int64_t borrow = 0;
     for (int i = 0; i < 8; i++) {
         int64_t cur = (int64_t)a[i] - (int64_t)b[i] - borrow;
@@ -130,7 +141,7 @@ static void mont_sub(uint* r, const uint* a, const uint* b) {
     if (borrow > 0) {
         uint64_t carry = 0;
         for (int i = 0; i < 8; i++) {
-            uint64_t v = (uint64_t)r[i] + (uint64_t)P[i] + carry;
+            uint64_t v = (uint64_t)r[i] + (uint64_t)P_loc[i] + carry;
             r[i] = (uint)(v & 0xFFFFFFFFULL);
             carry = v >> 32;
         }
@@ -142,7 +153,9 @@ static void mont_double(uint* r, const uint* a) { mont_add(r, a, a); }
 
 // Convert canonical -> Montgomery form (multiply by R^2).
 static void to_mont(uint* r, const uint* a) {
-    mont_mul(r, a, R2_MONT);
+    uint R2_loc[8];
+    for (int j = 0; j < 8; j++) R2_loc[j] = R2_MONT[j];
+    mont_mul(r, a, R2_loc);
 }
 
 // Convert Montgomery -> canonical form (multiply by 1).
@@ -153,10 +166,13 @@ static void from_mont(uint* r, const uint* a) {
 
 // Modular inverse via Fermat: a^-1 = a^(p-2), MSB-first square-and-multiply.
 static void fe_inv(uint* r, const uint* a) {
+    uint R_loc[8];
+    for (int j = 0; j < 8; j++) R_loc[j] = R_MONT[j];
+
     uint e[8] = { 0xFFFFFC2Du, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu,
                   0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
     uint res[8];
-    for (int i = 0; i < 8; i++) res[i] = R_MONT[i];
+    for (int i = 0; i < 8; i++) res[i] = R_loc[i];
     for (int i = 7; i >= 0; i--) {
         for (int bit = 31; bit >= 0; bit--) {
             uint t[8];
@@ -213,8 +229,11 @@ static void j_double(uint* RX, uint* RY, uint* RZ,
 static void j_add_mixed(uint* RX, uint* RY, uint* RZ,
                         const uint* PX, const uint* PY, const uint* PZ,
                         const uint* qx, const uint* qy) {
+    uint R_loc[8];
+    for (int j = 0; j < 8; j++) R_loc[j] = R_MONT[j];
+
     if (fe_is_zero(PZ)) {
-        for (int i = 0; i < 8; i++) { RX[i] = qx[i]; RY[i] = qy[i]; RZ[i] = R_MONT[i]; }
+        for (int i = 0; i < 8; i++) { RX[i] = qx[i]; RY[i] = qy[i]; RZ[i] = R_loc[i]; }
         return;
     }
     uint z1z1[8], u2[8], s2[8], h[8], r[8], z1cubed[8];
@@ -473,8 +492,13 @@ __kernel void batch_affine(__global const uint* restrict jac,
         mont_mul(z3_inv, z2_inv, z_inv);
 
         size_t xybase = (size_t)idx * 24;
-        mont_mul(ax, &jac[xybase], z2_inv);
-        mont_mul(ay, &jac[xybase + 8], z3_inv);
+        uint px[8], py[8];
+        for (int k = 0; k < 8; k++) {
+            px[k] = jac[xybase + k];
+            py[k] = jac[xybase + 8 + k];
+        }
+        mont_mul(ax, px, z2_inv);
+        mont_mul(ay, py, z3_inv);
 
         uint cx[8], cy[8];
         from_mont(cx, ax);
